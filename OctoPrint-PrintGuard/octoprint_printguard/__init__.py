@@ -324,6 +324,26 @@ class PrintGuardPlugin(
                 pass
         return "http://127.0.0.1:8080/?action=snapshot"
 
+    @staticmethod
+    def _detect_usb_camera_name(dev_index: int) -> Optional[str]:
+        """Return V4L2 hardware name if /dev/video<dev_index> is connected, else None."""
+        dev_path = f"/dev/video{dev_index}"
+        sys_name_path = f"/sys/class/video4linux/video{dev_index}/name"
+        if not os.path.exists(dev_path):
+            return None
+        try:
+            if os.path.isfile(sys_name_path):
+                with open(sys_name_path, "r", encoding="utf-8") as f:
+                    name = f.read().strip()
+                if name and not name.startswith("bcm2835") and not name.startswith("rpivid"):
+                    return name
+            return f"USB Camera (/dev/video{dev_index})"
+        except Exception:
+            return f"USB Camera (/dev/video{dev_index})"
+
+    def _is_cam2_connected(self) -> bool:
+        return self._detect_usb_camera_name(2) is not None
+
     def _has_phone_camera(self) -> bool:
         return bool(
             str(self._get_setting("phone_camera_ip", "")).strip()
@@ -339,7 +359,9 @@ class PrintGuardPlugin(
             elif choice == "cam2_phone":
                 sources = ["camera2", "phone"]
             else:
-                sources = ["camera1", "camera2"]
+                sources = ["camera1"]
+                if self._is_cam2_connected():
+                    sources.append("camera2")
                 if self._has_phone_camera():
                     sources.append("phone")
 
@@ -640,49 +662,54 @@ class PrintGuardPlugin(
         if phone_ip and phone_ip not in phone_label:
             phone_label = f"{phone_label} ({phone_ip})"
 
+        cam1_hw = self._detect_usb_camera_name(0)
+        cam2_hw = self._detect_usb_camera_name(2)
+        cam2_connected = cam2_hw is not None
+
+        cam1_label = (
+            f"Camera 1: {cam1_hw} (/dev/video0)"
+            if cam1_hw
+            else str(
+                self._get_setting(
+                    "camera1_name", "Camera 1: USB2.0 PC Camera (/dev/video0)"
+                )
+            )
+        )
+        cam2_label = (
+            f"Camera 2: {cam2_hw} (/dev/video2)"
+            if cam2_hw
+            else "Camera 2 (/dev/video2 — Disconnected)"
+        )
+
+        options: List[Dict[str, str]] = [
+            {"id": "camera1", "label": cam1_label},
+        ]
+        if cam2_connected:
+            options.append({"id": "camera2", "label": cam2_label})
+        options.append({"id": "phone", "label": phone_label})
+        options.append(
+            {
+                "id": "both",
+                "label": "All Connected Cameras (Side-by-Side)"
+                if not cam2_connected
+                else "All Cameras (Camera 1 + Camera 2 + Phone)",
+            }
+        )
+        options.append(
+            {"id": "cam1_phone", "label": "Camera 1 + Phone Camera (Side-by-Side)"}
+        )
+        if cam2_connected:
+            options.append(
+                {"id": "cam2_phone", "label": "Camera 2 + Phone Camera (Side-by-Side)"}
+            )
+        options.append({"id": "custom", "label": "Custom Snapshot URL"})
+
         return {
             "is_monitoring": self._is_monitoring,
             "active_camera": str(self._get_setting("active_camera", "camera1")),
             "phone_camera_ip": phone_ip,
-            "camera_options": [
-                {
-                    "id": "camera1",
-                    "label": str(
-                        self._get_setting(
-                            "camera1_name", "Camera 1: USB2.0 PC Camera (/dev/video0)"
-                        )
-                    ),
-                },
-                {
-                    "id": "camera2",
-                    "label": str(
-                        self._get_setting(
-                            "camera2_name",
-                            "Camera 2: Microsoft LifeCam VX-5000 (/dev/video2)",
-                        )
-                    ),
-                },
-                {
-                    "id": "phone",
-                    "label": phone_label,
-                },
-                {
-                    "id": "both",
-                    "label": "All Cameras (Camera 1 + Camera 2 + Phone)",
-                },
-                {
-                    "id": "cam1_phone",
-                    "label": "Camera 1 + Phone Camera (Side-by-Side)",
-                },
-                {
-                    "id": "cam2_phone",
-                    "label": "Camera 2 + Phone Camera (Side-by-Side)",
-                },
-                {
-                    "id": "custom",
-                    "label": "Custom Snapshot URL",
-                },
-            ],
+            "cam2_connected": cam2_connected,
+            "camera_options": options,
             "consecutive_failures": self._consecutive_failures,
             "consecutive_failures_threshold": int(
                 self._get_setting("consecutive_failures_threshold", 2)

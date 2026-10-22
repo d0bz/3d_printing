@@ -48,3 +48,58 @@
     height: 10px;
     margin-bottom: 10px;
 }
+
+.printguard-enlarge-backdrop {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(10, 12, 16, 0.88);
+    z-index: 10050;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+}
+
+.printguard-enlarge-modal {
+    background: #14171d;
+    border: 1px solid #2e3440;
+    border-radius: 8px;
+    max-width: 95vw;
+    max-height: 94vh;
+    width: 1180px;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 16px 48px rgba(0, 0, 0, 0.65);
+    overflow: hidden;
+}
+
+.printguard-enlarge-toolbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 14px;
+    background: #1f242d;
+    border-bottom: 1px solid #2e3440;
+}
+
+.printguard-enlarge-body {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #0d0f13;
+    overflow: hidden;
+    padding: 8px;
+}
+
+.printguard-enlarge-img {
+    max-width: 92vw;
+    max-height: 82vh;
+    width: auto;
+    height: auto;
+    object-fit: contain;
+    border-radius: 4px;
+}

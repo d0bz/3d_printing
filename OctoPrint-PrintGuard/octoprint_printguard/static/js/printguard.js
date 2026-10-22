@@ -41,12 +41,28 @@ $(function () {
         self.snapshotTimestamp = ko.observable(Date.now());
         self.liveFrameTimestamp = ko.observable(Date.now());
         self.viewFeedMode = ko.observable("annotated");
+        self.cam2Connected = ko.observable(false);
+        self.isEnlarged = ko.observable(false);
+
+        self.toggleEnlarge = function () {
+            self.isEnlarged(!self.isEnlarged());
+        };
+
+        self.closeEnlarge = function () {
+            self.isEnlarged(false);
+        };
+
+        $(document).on("keydown.printguardEnlarge", function (e) {
+            if (e.key === "Escape" && self.isEnlarged()) {
+                self.isEnlarged(false);
+            }
+        });
 
         setInterval(function () {
             if (self.viewFeedMode() !== "annotated") {
                 self.liveFrameTimestamp(Date.now());
             }
-        }, 400);
+        }, 300);
 
         self.snapshotUrl = ko.pureComputed(function () {
             return "plugin/printguard/snapshot.jpg?t=" + self.snapshotTimestamp();
@@ -122,6 +138,12 @@ $(function () {
         self.applyState = function (data) {
             if (!data) return;
             self.isMonitoring(!!data.is_monitoring);
+            if (data.cam2_connected !== undefined) {
+                self.cam2Connected(!!data.cam2_connected);
+                if (!data.cam2_connected && self.viewFeedMode() === "cam2") {
+                    self.viewFeedMode("phone");
+                }
+            }
             if (data.camera_options && data.camera_options.length) {
                 self.cameraOptions(data.camera_options);
             }
