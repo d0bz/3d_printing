@@ -10,7 +10,10 @@ $(function () {
         self.cameraOptions = ko.observableArray([
             { id: "camera1", label: "Camera 1: USB2.0 PC Camera (/dev/video0)" },
             { id: "camera2", label: "Camera 2: Microsoft LifeCam VX-5000 (/dev/video2)" },
-            { id: "both", label: "Both Cameras (Side-by-Side Dual Inspection)" },
+            { id: "phone", label: "Android Phone IP Camera" },
+            { id: "both", label: "All Cameras (Camera 1 + Camera 2 + Phone)" },
+            { id: "cam1_phone", label: "Camera 1 + Phone Camera (Side-by-Side)" },
+            { id: "cam2_phone", label: "Camera 2 + Phone Camera (Side-by-Side)" },
             { id: "custom", label: "Custom Snapshot URL" }
         ]);
         self.checkInterval = ko.observable(10);

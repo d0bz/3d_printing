@@ -324,17 +324,44 @@ class PrintGuardPlugin(
                 pass
         return "http://127.0.0.1:8080/?action=snapshot"
 
+    def _has_phone_camera(self) -> bool:
+        return bool(
+            str(self._get_setting("phone_camera_ip", "")).strip()
+            or str(self._get_setting("phone_snapshot_url", "")).strip()
+        )
+
     def fetch_snapshot(self) -> bytes:
-        """Fetch raw JPEG snapshot bytes from the selected camera (or stitch both cameras side-by-side)."""
+        """Fetch raw JPEG snapshot bytes from the selected camera(s) and stitch if multi-camera is selected."""
         choice = str(self._get_setting("active_camera", "camera1")).strip()
-        if choice == "both":
-            url1 = self._resolve_snapshot_url("camera1")
-            url2 = self._resolve_snapshot_url("camera2")
-            r1 = requests.get(url1, timeout=8)
-            r1.raise_for_status()
-            r2 = requests.get(url2, timeout=8)
-            r2.raise_for_status()
-            return self._stitch_snapshots(r1.content, r2.content)
+        if choice in ("both", "all", "cam1_phone", "cam2_phone"):
+            if choice == "cam1_phone":
+                sources = ["camera1", "phone"]
+            elif choice == "cam2_phone":
+                sources = ["camera2", "phone"]
+            else:
+                sources = ["camera1", "camera2"]
+                if self._has_phone_camera():
+                    sources.append("phone")
+
+            frames: List[bytes] = []
+            last_err: Optional[Exception] = None
+            for src in sources:
+                try:
+                    u = self._resolve_snapshot_url(src)
+                    r = requests.get(u, timeout=6)
+                    r.raise_for_status()
+                    frames.append(r.content)
+                except Exception as exc:
+                    last_err = exc
+                    self._logger.debug("Multi-cam source '%s' unavailable: %s", src, exc)
+
+            if not frames:
+                if last_err:
+                    raise last_err
+                raise RuntimeError("No camera snapshots could be fetched.")
+            if len(frames) == 1:
+                return frames[0]
+            return self._stitch_snapshots(*frames)
 
         url = self._resolve_snapshot_url(choice)
         resp = requests.get(url, timeout=8)
@@ -342,20 +369,28 @@ class PrintGuardPlugin(
         return resp.content
 
     @staticmethod
-    def _stitch_snapshots(jpeg1: bytes, jpeg2: bytes) -> bytes:
-        """Stitch two camera snapshots side-by-side into a single composite JPEG."""
+    def _stitch_snapshots(*jpegs: bytes) -> bytes:
+        """Stitch two or more camera snapshots side-by-side into a single composite JPEG."""
         resample_bilinear = getattr(Image, "Resampling", Image).BILINEAR
-        with Image.open(io.BytesIO(jpeg1)) as im1, Image.open(io.BytesIO(jpeg2)) as im2:
-            rgb1 = im1.convert("RGB").resize((320, 240), resample_bilinear)
-            rgb2 = im2.convert("RGB").resize((320, 240), resample_bilinear)
-            combined = Image.new("RGB", (640, 240))
-            combined.paste(rgb1, (0, 0))
-            combined.paste(rgb2, (320, 0))
-            draw = ImageDraw.Draw(combined)
-            draw.line([(320, 0), (320, 240)], fill=(90, 140, 220), width=2)
-            out = io.BytesIO()
-            combined.save(out, format="JPEG", quality=88)
-            return out.getvalue()
+        panel_w, panel_h = 320, 240
+        count = len(jpegs)
+        combined = Image.new("RGB", (panel_w * count, panel_h))
+        draw = ImageDraw.Draw(combined)
+
+        for idx, data in enumerate(jpegs):
+            with Image.open(io.BytesIO(data)) as im:
+                rgb = im.convert("RGB").resize((panel_w, panel_h), resample_bilinear)
+                combined.paste(rgb, (idx * panel_w, 0))
+            if idx > 0:
+                draw.line(
+                    [(idx * panel_w, 0), (idx * panel_w, panel_h)],
+                    fill=(90, 140, 220),
+                    width=2,
+                )
+
+        out = io.BytesIO()
+        combined.save(out, format="JPEG", quality=88)
+        return out.getvalue()
 
     def _build_printer_context(self) -> PrinterContext:
         is_printing = False
@@ -633,7 +668,15 @@ class PrintGuardPlugin(
                 },
                 {
                     "id": "both",
-                    "label": "Both Cameras (Side-by-Side Dual Inspection)",
+                    "label": "All Cameras (Camera 1 + Camera 2 + Phone)",
+                },
+                {
+                    "id": "cam1_phone",
+                    "label": "Camera 1 + Phone Camera (Side-by-Side)",
+                },
+                {
+                    "id": "cam2_phone",
+                    "label": "Camera 2 + Phone Camera (Side-by-Side)",
                 },
                 {
                     "id": "custom",
@@ -717,7 +760,15 @@ class PrintGuardPlugin(
 
         if command == "select_camera":
             cam = str(data.get("camera", "camera1")).strip()
-            if cam not in ("camera1", "camera2", "phone", "both", "custom"):
+            if cam not in (
+                "camera1",
+                "camera2",
+                "phone",
+                "both",
+                "cam1_phone",
+                "cam2_phone",
+                "custom",
+            ):
                 cam = "camera1"
             if self._settings is not None:
                 try:
