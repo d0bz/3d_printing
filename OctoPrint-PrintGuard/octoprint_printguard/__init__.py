@@ -847,8 +847,40 @@ class PrintGuardPlugin(
     def is_blueprint_protected(self) -> bool:
         return False
 
+    @staticmethod
+    def _is_logged_in() -> bool:
+        try:
+            import flask_login  # type: ignore
+
+            return bool(
+                flask_login.current_user
+                and flask_login.current_user.is_authenticated
+            )
+        except Exception:
+            return False
+
+    @staticmethod
+    def _is_direct_local_lan() -> bool:
+        if flask is None:
+            return False
+        if flask.request.headers.get("CF-Connecting-IP") or flask.request.headers.get(
+            "CF-Ray"
+        ):
+            return False
+        xff = (
+            flask.request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+        )
+        client_ip = xff or (flask.request.remote_addr or "")
+        return (
+            client_ip.startswith("192.168.")
+            or client_ip.startswith("10.")
+            or client_ip == "127.0.0.1"
+        )
+
     @_blueprint_route("/snapshot.jpg", methods=["GET"])
     def get_annotated_snapshot(self) -> Any:
+        if not self._is_logged_in():
+            return flask.Response("OctoPrint login required", status=403)
         if self._latest_annotated_jpeg is None:
             placeholder = self._generate_test_card(
                 DetectionResult(
@@ -860,8 +892,41 @@ class PrintGuardPlugin(
             return flask.Response(placeholder, mimetype="image/jpeg")
         return flask.Response(self._latest_annotated_jpeg, mimetype="image/jpeg")
 
+    @_blueprint_route("/frame/<cam_id>.jpg", methods=["GET"])
+    def get_live_camera_frame(self, cam_id: str) -> Any:
+        if not self._is_logged_in():
+            return flask.Response("OctoPrint login required", status=403)
+        target_map = {
+            "phone": "phone",
+            "cam1": "camera1",
+            "cam2": "camera2",
+        }
+        choice = target_map.get(cam_id, "camera1")
+        try:
+            url = self._resolve_snapshot_url(choice)
+            resp = requests.get(url, timeout=4)
+            resp.raise_for_status()
+            return flask.Response(
+                resp.content,
+                mimetype="image/jpeg",
+                headers={
+                    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"
+                },
+            )
+        except Exception as exc:
+            err_card = self._generate_test_card(
+                DetectionResult(
+                    status=DetectionStatus.WARNING,
+                    confidence=0.0,
+                    explanation=f"Camera '{cam_id}' unreachable: {exc}",
+                )
+            )
+            return flask.Response(err_card, mimetype="image/jpeg")
+
     @_blueprint_route("/PrintGuardCam.apk", methods=["GET"])
     def download_android_apk(self) -> Any:
+        if not (self._is_logged_in() or self._is_direct_local_lan()):
+            return flask.Response("OctoPrint login required", status=403)
         apk_path = os.path.join(os.path.dirname(__file__), "static", "PrintGuardCam.apk")
         if not os.path.isfile(apk_path):
             return flask.Response("APK file not found", status=404)
@@ -878,6 +943,8 @@ class PrintGuardPlugin(
 
     @_blueprint_route("/pair_phone", methods=["POST"])
     def pair_phone_camera(self) -> Any:
+        if not (self._is_logged_in() or self._is_direct_local_lan()):
+            return flask.Response("OctoPrint login required", status=403)
         data = flask.request.get_json(silent=True) or {}
         phone_ip = str(data.get("ip") or flask.request.remote_addr or "").strip()
         phone_port = int(data.get("port") or 8080)
