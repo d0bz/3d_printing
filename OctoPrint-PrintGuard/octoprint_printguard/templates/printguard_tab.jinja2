@@ -1,0 +1,168 @@
+<div class="printguard-tab-container">
+    <div class="row-fluid printguard-header">
+        <div class="span7">
+            <h3>
+                <i class="fa fa-shield"></i> PrintGuard Failure Detection
+                <span class="label" data-bind="css: statusBadgeClass, text: statusBadgeText"></span>
+            </h3>
+            <p class="muted">
+                Real-time camera inspection for air printing (no extrusion), bed detachment/warping, and spaghetti.
+            </p>
+        </div>
+        <div class="span5 text-right printguard-actions">
+            <div style="margin-bottom: 6px;">
+                <label style="display: inline-block; margin-right: 4px; font-weight: bold;">
+                    <i class="fa fa-video-camera"></i> Camera:
+                </label>
+                <select class="input-medium" style="margin-bottom: 0; margin-right: 8px;"
+                        data-bind="options: cameraOptions, optionsText: 'label', optionsValue: 'id', value: activeCamera, event: { change: onCameraChange }">
+                </select>
+                <label style="display: inline-block; margin-right: 4px; font-weight: bold;">
+                    <i class="fa fa-clock-o"></i> Every:
+                </label>
+                <select class="input-small" style="margin-bottom: 0;"
+                        data-bind="options: intervalOptions, optionsText: 'label', optionsValue: 'val', value: checkInterval, event: { change: onIntervalChange }">
+                </select>
+            </div>
+            <button class="btn" data-bind="click: toggleMonitoring, css: {'btn-success': isMonitoring(), 'btn-default': !isMonitoring()}" title="Start or stop periodic background checks">
+                <i class="fa" data-bind="css: {'fa-stop': isMonitoring(), 'fa-play': !isMonitoring()}"></i>
+                <span data-bind="text: isMonitoring() ? 'Auto-Check: ON' : 'Auto-Check: OFF'"></span>
+            </button>
+            <button class="btn btn-primary" data-bind="click: runManualCheck, disable: isChecking">
+                <i class="fa fa-camera" data-bind="css: {'fa-spin fa-spinner': isChecking, 'fa-camera': !isChecking()}"></i>
+                <span data-bind="text: isChecking() ? 'Analyzing...' : 'Check Now'"></span>
+            </button>
+            <button class="btn" data-bind="click: togglePhoneTorch" title="Toggle Android Phone Camera Flashlight">
+                <i class="fa fa-bolt"></i> Torch
+            </button>
+            <button class="btn" data-bind="click: resetCounter" title="Reset consecutive failure counter & baseline">
+                <i class="fa fa-refresh"></i> Reset
+            </button>
+            <button class="btn" data-bind="click: testNotifications" title="Send a test alert to enabled webhooks">
+                <i class="fa fa-bell"></i> Test Alert
+            </button>
+            <a class="btn btn-info" href="plugin/printguard/PrintGuardCam.apk" download="PrintGuardCam.apk" title="Download Android IP Camera APK">
+                <i class="fa fa-android"></i> APK
+            </a>
+        </div>
+    </div>
+
+    <div class="row-fluid">
+        <!-- Annotated Camera Snapshot Panel -->
+        <div class="span7">
+            <div class="well printguard-snapshot-box">
+                <div class="printguard-snapshot-wrapper">
+                    <img class="printguard-snapshot-img" data-bind="attr: { src: snapshotUrl }" alt="PrintGuard Annotated Camera Snapshot" />
+                </div>
+                <div class="printguard-explanation" data-bind="text: lastExplanation"></div>
+            </div>
+        </div>
+
+        <!-- Telemetry & Sub-Score Meters -->
+        <div class="span5">
+            <div class="well">
+                <h4>Detection Metrics</h4>
+                <table class="table table-condensed printguard-summary-table">
+                    <tbody>
+                        <tr>
+                            <th>Monitoring State</th>
+                            <td><span data-bind="text: isMonitoring() ? 'Active (Printing)' : 'Standby'"></span></td>
+                        </tr>
+                        <tr>
+                            <th>Detection Engine</th>
+                            <td><span class="label label-info" data-bind="text: detectionMode"></span></td>
+                        </tr>
+                        <tr>
+                            <th>Consecutive Failures</th>
+                            <td>
+                                <strong data-bind="text: consecutiveFailures"></strong> /
+                                <span data-bind="text: consecutiveThreshold"></span> before auto-pause
+                            </td>
+                        </tr>
+                        <tr>
+                            <th>Tracked Z Height</th>
+                            <td><span data-bind="text: formattedZ"></span></td>
+                        </tr>
+                        <tr>
+                            <th>Overall Risk Score</th>
+                            <td><strong data-bind="text: overallConfidencePct"></strong></td>
+                        </tr>
+                    </tbody>
+                </table>
+
+                <h5>Failure Mode Breakdown</h5>
+                <div class="printguard-meter-group">
+                    <div class="printguard-meter-label">
+                        <span>No Extrusion / Air Printing</span>
+                        <span data-bind="text: scoreNoExtrusionPct"></span>
+                    </div>
+                    <div class="progress progress-small">
+                        <div class="bar" data-bind="style: { width: scoreNoExtrusionPct }, css: barClass(scoreNoExtrusion())"></div>
+                    </div>
+
+                    <div class="printguard-meter-label">
+                        <span>Bed Detachment / Warping</span>
+                        <span data-bind="text: scoreBedDetachmentPct"></span>
+                    </div>
+                    <div class="progress progress-small">
+                        <div class="bar" data-bind="style: { width: scoreBedDetachmentPct }, css: barClass(scoreBedDetachment())"></div>
+                    </div>
+
+                    <div class="printguard-meter-label">
+                        <span>Spaghetti / Tangled Strands</span>
+                        <span data-bind="text: scoreSpaghettiPct"></span>
+                    </div>
+                    <div class="progress progress-small">
+                        <div class="bar" data-bind="style: { width: scoreSpaghettiPct }, css: barClass(scoreSpaghetti())"></div>
+                    </div>
+
+                    <div class="printguard-meter-label">
+                        <span>Layer Shift / Nozzle Blob</span>
+                        <span data-bind="text: scoreOtherPct"></span>
+                    </div>
+                    <div class="progress progress-small">
+                        <div class="bar" data-bind="style: { width: scoreOtherPct }, css: barClass(scoreOther())"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Recent Inspection History -->
+    <div class="row-fluid">
+        <div class="span12">
+            <h4>Recent Inspection Log</h4>
+            <table class="table table-striped table-bordered table-condensed">
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Status</th>
+                        <th>Confidence</th>
+                        <th>Detected Issues</th>
+                        <th>Z Height</th>
+                        <th>Source</th>
+                        <th>Notes / Action</th>
+                    </tr>
+                </thead>
+                <tbody data-bind="foreach: history">
+                    <tr>
+                        <td data-bind="text: $parent.formatTimestamp(timestamp)"></td>
+                        <td>
+                            <span class="label" data-bind="text: status.toUpperCase(), css: $parent.rowBadgeClass(status)"></span>
+                        </td>
+                        <td data-bind="text: Math.round(confidence * 100) + '%'"></td>
+                        <td data-bind="text: (failure_labels && failure_labels.length) ? failure_labels.join(', ') : 'None'"></td>
+                        <td data-bind="text: z_height !== null && z_height !== undefined ? z_height.toFixed(2) + ' mm' : '-'"></td>
+                        <td data-bind="text: source"></td>
+                        <td>
+                            <span data-bind="text: explanation"></span>
+                            <!-- ko if: action_taken -->
+                            <span class="label label-important" data-bind="text: action_taken"></span>
+                            <!-- /ko -->
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>

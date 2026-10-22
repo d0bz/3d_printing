@@ -1,0 +1,284 @@
+<form class="form-horizontal">
+    <h3>PrintGuard — 3D Print Failure Detection Settings</h3>
+
+    <h4>1. Camera & Monitoring Schedule</h4>
+    <div class="control-group">
+        <div class="controls">
+            <label class="checkbox">
+                <input type="checkbox" data-bind="checked: settings.plugins.printguard.enabled">
+                Enable PrintGuard monitoring during prints
+            </label>
+        </div>
+    </div>
+
+    <div class="control-group">
+        <label class="control-label">Active Camera Source</label>
+        <div class="controls">
+            <select class="input-xlarge" data-bind="value: settings.plugins.printguard.active_camera">
+                <option value="camera1">Camera 1: USB2.0 PC Camera (/dev/video0 — port 8080)</option>
+                <option value="camera2">Camera 2: Microsoft LifeCam VX-5000 (/dev/video2 — port 8081)</option>
+                <option value="phone">Android Phone IP Camera (PrintGuardCam APK)</option>
+                <option value="both">Both USB Cameras (Side-by-Side Dual Inspection)</option>
+                <option value="custom">Custom Snapshot URL</option>
+            </select>
+        </div>
+    </div>
+
+    <div class="control-group">
+        <label class="control-label">Android Phone Camera IP</label>
+        <div class="controls">
+            <input type="text" class="input-medium" placeholder="e.g. 192.168.0.55"
+                   data-bind="value: settings.plugins.printguard.phone_camera_ip">
+            <a class="btn btn-small btn-info" href="plugin/printguard/PrintGuardCam.apk" download="PrintGuardCam.apk" style="margin-left: 8px;">
+                <i class="fa fa-android"></i> Download PrintGuardCam.apk
+            </a>
+            <span class="help-block">Or tap <strong>"One-Tap Pair with OctoPrint"</strong> inside the Android app to configure this automatically.</span>
+        </div>
+    </div>
+
+    <div class="control-group">
+        <label class="control-label">Camera 1 Snapshot URL</label>
+        <div class="controls">
+            <input type="text" class="input-xxlarge"
+                   data-bind="value: settings.plugins.printguard.camera1_snapshot_url">
+            <span class="help-block">Default for Camera 1 (<code>/dev/video0</code>): <code>http://127.0.0.1:8080/?action=snapshot</code></span>
+        </div>
+    </div>
+
+    <div class="control-group">
+        <label class="control-label">Camera 2 Snapshot URL</label>
+        <div class="controls">
+            <input type="text" class="input-xxlarge"
+                   data-bind="value: settings.plugins.printguard.camera2_snapshot_url">
+            <span class="help-block">Default for Camera 2 (<code>/dev/video2</code>): <code>http://127.0.0.1:8081/?action=snapshot</code></span>
+        </div>
+    </div>
+
+    <div class="control-group">
+        <label class="control-label">Custom Snapshot URL</label>
+        <div class="controls">
+            <input type="text" class="input-xxlarge" placeholder="Used when Active Camera Source is set to Custom"
+                   data-bind="value: settings.plugins.printguard.snapshot_url">
+        </div>
+    </div>
+
+    <div class="control-group">
+        <label class="control-label">Check Interval (seconds)</label>
+        <div class="controls">
+            <input type="number" class="input-small" min="2" max="600"
+                   data-bind="value: settings.plugins.printguard.check_interval_seconds">
+            <span class="help-block">How often (in seconds) PrintGuard captures and inspects a camera frame during printing (default: <code>10</code>s).</span>
+        </div>
+    </div>
+
+    <div class="control-group">
+        <label class="control-label">Vision AI Check Every N Checks</label>
+        <div class="controls">
+            <input type="number" class="input-small" min="1" max="100"
+                   data-bind="value: settings.plugins.printguard.vision_ai_periodic_interval">
+            <span class="help-block">In <strong>Hybrid</strong> mode, Local CV runs every check interval, and Vision AI (Gemini/OpenAI/Ollama) is called every <code>N</code> checks (or immediately if Local CV detects a suspicion). Set to <code>1</code> to call Vision AI on every single check.</span>
+        </div>
+    </div>
+
+    <div class="control-group">
+        <label class="control-label">Initial Grace Period (seconds)</label>
+        <div class="controls">
+            <input type="number" class="input-small" min="0" max="600"
+                   data-bind="value: settings.plugins.printguard.initial_grace_seconds">
+            <span class="help-block">Wait this many seconds after print start before triggering auto-pause (allows bed homing and purge line).</span>
+        </div>
+    </div>
+
+    <hr>
+    <h4>2. Detection Engine (Hybrid CV + Vision AI)</h4>
+
+    <div class="control-group">
+        <label class="control-label">Detection Mode</label>
+        <div class="controls">
+            <select data-bind="value: settings.plugins.printguard.detection_mode">
+                <option value="hybrid">Hybrid (Local OpenCV/ONNX + Vision AI escalation)</option>
+                <option value="local_only">Local Computer Vision Only (OpenCV / ONNX)</option>
+                <option value="vision_ai_only">Vision AI Only (Gemini / OpenAI / Ollama)</option>
+            </select>
+        </div>
+    </div>
+
+    <div class="control-group">
+        <label class="control-label">Sensitivity Multiplier</label>
+        <div class="controls">
+            <input type="number" step="0.1" min="0.2" max="2.5" class="input-small"
+                   data-bind="value: settings.plugins.printguard.sensitivity">
+            <span class="help-block">Default <code>1.0</code>. Increase (e.g. <code>1.3</code>) for stricter detection, decrease (e.g. <code>0.8</code>) to reduce false positives.</span>
+        </div>
+    </div>
+
+    <div class="control-group">
+        <label class="control-label">Warning / Failure Thresholds</label>
+        <div class="controls">
+            Warning:
+            <input type="number" step="0.05" min="0.1" max="0.95" class="input-mini"
+                   data-bind="value: settings.plugins.printguard.warning_threshold">
+            &nbsp;&nbsp;Failure:
+            <input type="number" step="0.05" min="0.2" max="0.99" class="input-mini"
+                   data-bind="value: settings.plugins.printguard.failure_threshold">
+        </div>
+    </div>
+
+    <div class="control-group">
+        <label class="control-label">Optional Local ONNX Model Path</label>
+        <div class="controls">
+            <input type="text" class="input-xxlarge" placeholder="/path/to/model.onnx (optional)"
+                   data-bind="value: settings.plugins.printguard.onnx_model_path">
+        </div>
+    </div>
+
+    <div class="control-group">
+        <label class="control-label">Vision AI Provider</label>
+        <div class="controls">
+            <select data-bind="value: settings.plugins.printguard.vision_provider">
+                <option value="gemini">Google Gemini API</option>
+                <option value="openai">OpenAI / OpenAI-Compatible API</option>
+                <option value="ollama">Local Ollama Vision Model</option>
+            </select>
+        </div>
+    </div>
+
+    <div class="control-group">
+        <label class="control-label">Vision AI Model</label>
+        <div class="controls">
+            <input type="text" class="input-large" placeholder="gemini-2.5-flash / gpt-4o-mini / llava"
+                   data-bind="value: settings.plugins.printguard.vision_model">
+        </div>
+    </div>
+
+    <div class="control-group">
+        <label class="control-label">Vision AI API Key</label>
+        <div class="controls">
+            <input type="password" class="input-xxlarge" placeholder="API Key (not required for local Ollama)"
+                   data-bind="value: settings.plugins.printguard.vision_api_key">
+        </div>
+    </div>
+
+    <div class="control-group">
+        <label class="control-label">Custom API Base URL</label>
+        <div class="controls">
+            <input type="text" class="input-xxlarge" placeholder="Optional override (e.g. http://localhost:11434 for Ollama)"
+                   data-bind="value: settings.plugins.printguard.vision_api_base_url">
+        </div>
+    </div>
+
+    <hr>
+    <h4>3. Automatic Printer Actions</h4>
+
+    <div class="control-group">
+        <div class="controls">
+            <label class="checkbox">
+                <input type="checkbox" data-bind="checked: settings.plugins.printguard.auto_pause_on_failure">
+                <strong>Pause print automatically</strong> when consecutive failure threshold is reached
+            </label>
+        </div>
+    </div>
+
+    <div class="control-group">
+        <label class="control-label">Consecutive Failures Required</label>
+        <div class="controls">
+            <input type="number" min="1" max="10" class="input-small"
+                   data-bind="value: settings.plugins.printguard.consecutive_failures_threshold">
+            <span class="help-block">Number of back-to-back failure checks before pausing the print.</span>
+        </div>
+    </div>
+
+    <div class="control-group">
+        <div class="controls">
+            <label class="checkbox">
+                <input type="checkbox" data-bind="checked: settings.plugins.printguard.turn_off_heaters_on_pause">
+                Turn off hotend and bed heaters (<code>M104 S0</code> / <code>M140 S0</code>) when auto-pausing
+            </label>
+        </div>
+    </div>
+
+    <div class="control-group">
+        <label class="control-label">Custom Pause G-code</label>
+        <div class="controls">
+            <textarea rows="2" class="input-xxlarge" placeholder="Optional G-code commands to run on failure pause"
+                      data-bind="value: settings.plugins.printguard.pause_gcode"></textarea>
+        </div>
+    </div>
+
+    <hr>
+    <h4>4. External Notifications & Webhooks</h4>
+
+    <div class="control-group">
+        <div class="controls">
+            <label class="checkbox">
+                <input type="checkbox" data-bind="checked: settings.plugins.printguard.notify_on_warning">
+                Also send notifications on warnings (not just confirmed failures)
+            </label>
+        </div>
+    </div>
+
+    <!-- Discord -->
+    <div class="control-group">
+        <label class="control-label">Discord Webhook</label>
+        <div class="controls">
+            <label class="checkbox">
+                <input type="checkbox" data-bind="checked: settings.plugins.printguard.discord_enabled">
+                Enable Discord notifications (includes annotated camera image)
+            </label>
+            <input type="text" class="input-xxlarge" style="margin-top: 6px;"
+                   placeholder="https://discord.com/api/webhooks/..."
+                   data-bind="value: settings.plugins.printguard.discord_webhook_url">
+        </div>
+    </div>
+
+    <!-- Telegram -->
+    <div class="control-group">
+        <label class="control-label">Telegram Bot</label>
+        <div class="controls">
+            <label class="checkbox">
+                <input type="checkbox" data-bind="checked: settings.plugins.printguard.telegram_enabled">
+                Enable Telegram notifications (includes annotated photo)
+            </label>
+            <div style="margin-top: 6px;">
+                <input type="password" class="input-large" placeholder="Bot Token (123456:ABC...)"
+                       data-bind="value: settings.plugins.printguard.telegram_bot_token">
+                <input type="text" class="input-medium" placeholder="Chat ID"
+                       data-bind="value: settings.plugins.printguard.telegram_chat_id">
+            </div>
+        </div>
+    </div>
+
+    <!-- Pushover -->
+    <div class="control-group">
+        <label class="control-label">Pushover</label>
+        <div class="controls">
+            <label class="checkbox">
+                <input type="checkbox" data-bind="checked: settings.plugins.printguard.pushover_enabled">
+                Enable Pushover notifications
+            </label>
+            <div style="margin-top: 6px;">
+                <input type="password" class="input-large" placeholder="API Token"
+                       data-bind="value: settings.plugins.printguard.pushover_api_token">
+                <input type="password" class="input-large" placeholder="User Key"
+                       data-bind="value: settings.plugins.printguard.pushover_user_key">
+            </div>
+        </div>
+    </div>
+
+    <!-- Generic JSON Webhook -->
+    <div class="control-group">
+        <label class="control-label">Custom JSON Webhook</label>
+        <div class="controls">
+            <label class="checkbox">
+                <input type="checkbox" data-bind="checked: settings.plugins.printguard.webhook_enabled">
+                Enable Generic Webhook (Home Assistant, n8n, Slack, Node-RED)
+            </label>
+            <div style="margin-top: 6px;">
+                <input type="text" class="input-xlarge" placeholder="https://your-server/webhook"
+                       data-bind="value: settings.plugins.printguard.webhook_url">
+                <input type="password" class="input-medium" placeholder="Optional Secret Header"
+                       data-bind="value: settings.plugins.printguard.webhook_secret">
+            </div>
+        </div>
+    </div>
+</form>

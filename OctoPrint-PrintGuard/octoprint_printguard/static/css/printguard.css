@@ -1,0 +1,50 @@
+.printguard-tab-container .printguard-header {
+    margin-bottom: 12px;
+}
+
+.printguard-tab-container .printguard-actions {
+    padding-top: 14px;
+}
+
+.printguard-snapshot-box {
+    padding: 10px;
+    text-align: center;
+}
+
+.printguard-snapshot-wrapper {
+    background: #1a1d24;
+    border-radius: 4px;
+    overflow: hidden;
+    margin-bottom: 8px;
+}
+
+.printguard-snapshot-img {
+    max-width: 100%;
+    height: auto;
+    display: block;
+    margin: 0 auto;
+}
+
+.printguard-explanation {
+    font-size: 13px;
+    font-weight: 500;
+    color: #333;
+    text-align: left;
+    padding: 4px 6px;
+}
+
+.printguard-summary-table th {
+    width: 48%;
+}
+
+.printguard-meter-group .printguard-meter-label {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    margin-bottom: 2px;
+}
+
+.printguard-meter-group .progress {
+    height: 10px;
+    margin-bottom: 10px;
+}
