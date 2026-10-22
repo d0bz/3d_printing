@@ -39,9 +39,18 @@ $(function () {
         self.scoreOther = ko.observable(0.0);
         self.history = ko.observableArray([]);
         self.snapshotTimestamp = ko.observable(Date.now());
+        self.viewFeedMode = ko.observable("annotated");
 
         self.snapshotUrl = ko.pureComputed(function () {
             return "plugin/printguard/snapshot.jpg?t=" + self.snapshotTimestamp();
+        });
+
+        self.activeFeedUrl = ko.pureComputed(function () {
+            var mode = self.viewFeedMode();
+            if (mode === "phone") return "/webcam3/?action=stream";
+            if (mode === "cam1") return "/webcam/?action=stream";
+            if (mode === "cam2") return "/webcam2/?action=stream";
+            return self.snapshotUrl();
         });
 
         self.formattedZ = ko.pureComputed(function () {

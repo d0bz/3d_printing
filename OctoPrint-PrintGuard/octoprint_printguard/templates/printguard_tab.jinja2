@@ -48,11 +48,25 @@
     </div>
 
     <div class="row-fluid">
-        <!-- Annotated Camera Snapshot Panel -->
+        <!-- Annotated Camera Snapshot / Live Stream Panel -->
         <div class="span7">
             <div class="well printguard-snapshot-box">
+                <div class="btn-group" style="margin-bottom: 8px;">
+                    <button class="btn btn-small" data-bind="click: function() { viewFeedMode('annotated'); }, css: {'btn-primary': viewFeedMode() === 'annotated'}">
+                        <i class="fa fa-crosshairs"></i> AI Annotated Snapshot
+                    </button>
+                    <button class="btn btn-small" data-bind="click: function() { viewFeedMode('phone'); }, css: {'btn-primary': viewFeedMode() === 'phone'}">
+                        <i class="fa fa-mobile"></i> Live Phone Stream
+                    </button>
+                    <button class="btn btn-small" data-bind="click: function() { viewFeedMode('cam1'); }, css: {'btn-primary': viewFeedMode() === 'cam1'}">
+                        <i class="fa fa-video-camera"></i> Live Cam 1
+                    </button>
+                    <button class="btn btn-small" data-bind="click: function() { viewFeedMode('cam2'); }, css: {'btn-primary': viewFeedMode() === 'cam2'}">
+                        <i class="fa fa-video-camera"></i> Live Cam 2
+                    </button>
+                </div>
                 <div class="printguard-snapshot-wrapper">
-                    <img class="printguard-snapshot-img" data-bind="attr: { src: snapshotUrl }" alt="PrintGuard Annotated Camera Snapshot" />
+                    <img class="printguard-snapshot-img" data-bind="attr: { src: activeFeedUrl }" alt="PrintGuard Camera Feed" />
                 </div>
                 <div class="printguard-explanation" data-bind="text: lastExplanation"></div>
             </div>
