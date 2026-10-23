@@ -106,6 +106,8 @@ class PrintGuardPlugin(
         self._last_result: Optional[DetectionResult] = None
         self._latest_annotated_jpeg: Optional[bytes] = None
         self._history: Deque[Dict[str, Any]] = deque(maxlen=30)
+        self._history_snapshots: Dict[str, bytes] = {}
+        self._history_snap_ids: Deque[str] = deque(maxlen=30)
 
         self._detector: Optional[HybridDetector] = None
         self._notifier: Optional[NotificationManager] = None
@@ -636,7 +638,20 @@ class PrintGuardPlugin(
             )
 
         self._last_result = result
-        self._history.appendleft(result.to_dict())
+        snap_id = str(int(result.timestamp * 1000))
+        if self._latest_annotated_jpeg:
+            if (
+                self._history_snap_ids.maxlen
+                and len(self._history_snap_ids) >= self._history_snap_ids.maxlen
+            ):
+                oldest_id = self._history_snap_ids.pop()
+                self._history_snapshots.pop(oldest_id, None)
+            self._history_snap_ids.appendleft(snap_id)
+            self._history_snapshots[snap_id] = self._latest_annotated_jpeg
+        entry = result.to_dict()
+        entry["snap_id"] = snap_id
+        entry["snapshot_url"] = f"plugin/printguard/history_snapshot/{snap_id}.jpg"
+        self._history.appendleft(entry)
         self._send_ui_update()
         return result
 
@@ -957,6 +972,19 @@ class PrintGuardPlugin(
             )
             return flask.Response(placeholder, mimetype="image/jpeg")
         return flask.Response(self._latest_annotated_jpeg, mimetype="image/jpeg")
+
+    @_blueprint_route("/history_snapshot/<snap_id>.jpg", methods=["GET"])
+    def get_history_snapshot(self, snap_id: str) -> Any:
+        if not self._is_logged_in():
+            return flask.Response("OctoPrint login required", status=403)
+        img_bytes = self._history_snapshots.get(snap_id) or self._latest_annotated_jpeg
+        if img_bytes is None:
+            return flask.Response("Snapshot not found", status=404)
+        return flask.Response(
+            img_bytes,
+            mimetype="image/jpeg",
+            headers={"Cache-Control": "private, max-age=3600"},
+        )
 
     @_blueprint_route("/frame/<cam_id>.jpg", methods=["GET"])
     def get_live_camera_frame(self, cam_id: str) -> Any:

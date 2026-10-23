@@ -103,3 +103,20 @@
     object-fit: contain;
     border-radius: 4px;
 }
+
+.printguard-log-thumb {
+    max-width: 88px;
+    max-height: 48px;
+    width: auto;
+    height: auto;
+    border-radius: 3px;
+    border: 1px solid #3b4252;
+    cursor: zoom-in;
+    display: inline-block;
+    transition: transform 0.12s ease;
+}
+
+.printguard-log-thumb:hover {
+    transform: scale(1.08);
+    border-color: #5e81ac;
+}

@@ -43,18 +43,33 @@ $(function () {
         self.viewFeedMode = ko.observable("annotated");
         self.cam2Connected = ko.observable(false);
         self.isEnlarged = ko.observable(false);
+        self.selectedHistoryImageUrl = ko.observable(null);
 
         self.toggleEnlarge = function () {
+            self.selectedHistoryImageUrl(null);
             self.isEnlarged(!self.isEnlarged());
         };
 
         self.closeEnlarge = function () {
             self.isEnlarged(false);
+            self.selectedHistoryImageUrl(null);
+        };
+
+        self.openHistoryImage = function (url) {
+            if (url) {
+                self.selectedHistoryImageUrl(url);
+                self.isEnlarged(true);
+            }
+        };
+
+        self.selectEnlargedFeed = function (mode) {
+            self.selectedHistoryImageUrl(null);
+            self.viewFeedMode(mode);
         };
 
         $(document).on("keydown.printguardEnlarge", function (e) {
             if (e.key === "Escape" && self.isEnlarged()) {
-                self.isEnlarged(false);
+                self.closeEnlarge();
             }
         });
 
@@ -102,6 +117,10 @@ $(function () {
                 return "plugin/printguard/frame/" + mode + ".jpg?t=" + self.liveFrameTimestamp();
             }
             return self.snapshotUrl();
+        });
+
+        self.enlargedUrl = ko.pureComputed(function () {
+            return self.selectedHistoryImageUrl() || self.activeFeedUrl();
         });
 
         self.formattedZ = ko.pureComputed(function () {

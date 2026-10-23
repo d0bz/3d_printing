@@ -155,6 +155,7 @@
                 <thead>
                     <tr>
                         <th>Time</th>
+                        <th>Image</th>
                         <th>Status</th>
                         <th>Confidence</th>
                         <th>Detected Issues</th>
@@ -166,6 +167,16 @@
                 <tbody data-bind="foreach: history">
                     <tr>
                         <td data-bind="text: $parent.formatTimestamp(timestamp)"></td>
+                        <td style="text-align: center; width: 96px;">
+                            <!-- ko if: $data.snapshot_url -->
+                            <img class="printguard-log-thumb" title="Click to enlarge snapshot"
+                                 data-bind="attr: { src: snapshot_url }, click: function() { $parent.openHistoryImage(snapshot_url); }"
+                                 alt="Inspection Snapshot" />
+                            <!-- /ko -->
+                            <!-- ko ifnot: $data.snapshot_url -->
+                            <span class="muted">-</span>
+                            <!-- /ko -->
+                        </td>
                         <td>
                             <span class="label" data-bind="text: status.toUpperCase(), css: $parent.rowBadgeClass(status)"></span>
                         </td>
@@ -190,16 +201,16 @@
         <div class="printguard-enlarge-modal" data-bind="click: function(data, event) { event.stopPropagation(); }">
             <div class="printguard-enlarge-toolbar">
                 <div class="btn-group">
-                    <button class="btn btn-small" data-bind="click: function() { viewFeedMode('annotated'); }, css: {'btn-primary': viewFeedMode() === 'annotated'}">
+                    <button class="btn btn-small" data-bind="click: function() { selectEnlargedFeed('annotated'); }, css: {'btn-primary': !selectedHistoryImageUrl() && viewFeedMode() === 'annotated'}">
                         <i class="fa fa-crosshairs"></i> AI Annotated Snapshot
                     </button>
-                    <button class="btn btn-small" data-bind="click: function() { viewFeedMode('phone'); }, css: {'btn-primary': viewFeedMode() === 'phone'}">
+                    <button class="btn btn-small" data-bind="click: function() { selectEnlargedFeed('phone'); }, css: {'btn-primary': !selectedHistoryImageUrl() && viewFeedMode() === 'phone'}">
                         <i class="fa fa-mobile"></i> Live Phone Stream
                     </button>
-                    <button class="btn btn-small" data-bind="click: function() { viewFeedMode('cam1'); }, css: {'btn-primary': viewFeedMode() === 'cam1'}">
+                    <button class="btn btn-small" data-bind="click: function() { selectEnlargedFeed('cam1'); }, css: {'btn-primary': !selectedHistoryImageUrl() && viewFeedMode() === 'cam1'}">
                         <i class="fa fa-video-camera"></i> Live Cam 1
                     </button>
-                    <button class="btn btn-small" data-bind="visible: cam2Connected, click: function() { viewFeedMode('cam2'); }, css: {'btn-primary': viewFeedMode() === 'cam2'}">
+                    <button class="btn btn-small" data-bind="visible: cam2Connected, click: function() { selectEnlargedFeed('cam2'); }, css: {'btn-primary': !selectedHistoryImageUrl() && viewFeedMode() === 'cam2'}">
                         <i class="fa fa-video-camera"></i> Live Cam 2
                     </button>
                 </div>
@@ -214,7 +225,7 @@
             </div>
             <div class="printguard-enlarge-body">
                 <!-- ko if: isEnlarged -->
-                <img class="printguard-enlarge-img" data-bind="attr: { src: activeFeedUrl }" alt="Enlarged Camera Stream" />
+                <img class="printguard-enlarge-img" data-bind="attr: { src: enlargedUrl }" alt="Enlarged Camera Stream" />
                 <!-- /ko -->
             </div>
         </div>
