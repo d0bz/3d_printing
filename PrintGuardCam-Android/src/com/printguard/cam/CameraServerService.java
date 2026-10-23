@@ -58,10 +58,10 @@ public class CameraServerService extends Service implements Camera.PreviewCallba
     private Camera camera;
     private SurfaceTexture offscreenTexture;
     private int currentCameraId = 0;
-    private int targetWidth = 1920;
-    private int targetHeight = 1080;
-    private int previewWidth = 1920;
-    private int previewHeight = 1080;
+    private int targetWidth = 1280;
+    private int targetHeight = 720;
+    private int previewWidth = 1280;
+    private int previewHeight = 720;
     private int rotationDegrees = 90;
     private boolean torchEnabled = false;
     private long lastEncodeTimeMs = 0;
@@ -387,12 +387,12 @@ public class CameraServerService extends Service implements Camera.PreviewCallba
         }
         try {
             long now = System.currentTimeMillis();
-            // Throttle JPEG encoding to ~10-12 FPS for crisp 1080p without overheating
-            if (now - lastEncodeTimeMs >= 85) {
+            // Throttle JPEG encoding to ~10 FPS for crisp 720p/1080p without Wi-Fi saturation
+            if (now - lastEncodeTimeMs >= 100) {
                 lastEncodeTimeMs = now;
                 YuvImage yuv = new YuvImage(data, ImageFormat.NV21, previewWidth, previewHeight, null);
                 ByteArrayOutputStream rawOut = new ByteArrayOutputStream();
-                int firstPassQuality = (rotationDegrees != 0) ? 96 : 92;
+                int firstPassQuality = (rotationDegrees != 0) ? 92 : 85;
                 yuv.compressToJpeg(new Rect(0, 0, previewWidth, previewHeight), firstPassQuality, rawOut);
                 byte[] jpegBytes = rawOut.toByteArray();
 
@@ -405,7 +405,7 @@ public class CameraServerService extends Service implements Camera.PreviewCallba
                                 bmp, 0, 0, bmp.getWidth(), bmp.getHeight(), matrix, true
                         );
                         ByteArrayOutputStream rotOut = new ByteArrayOutputStream();
-                        rotated.compress(Bitmap.CompressFormat.JPEG, 92, rotOut);
+                        rotated.compress(Bitmap.CompressFormat.JPEG, 85, rotOut);
                         jpegBytes = rotOut.toByteArray();
                         bmp.recycle();
                         rotated.recycle();
@@ -463,7 +463,9 @@ public class CameraServerService extends Service implements Camera.PreviewCallba
     private void handleClient(Socket socket) {
         activeClients.incrementAndGet();
         try {
-            socket.setSoTimeout(15000);
+            socket.setSoTimeout(5000);
+            socket.setTcpNoDelay(true);
+            socket.setSoLinger(true, 2);
             BufferedReader reader = new BufferedReader(
                     new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8)
             );

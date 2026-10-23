@@ -257,7 +257,7 @@ public class MainActivity extends Activity implements ServiceConnection {
         LinearLayout row2 = new LinearLayout(this);
         row2.setOrientation(LinearLayout.HORIZONTAL);
 
-        btnResolution = createButton("Quality: 1080p", Color.rgb(45, 55, 72));
+        btnResolution = createButton("Quality: 720p", Color.rgb(45, 55, 72));
         btnResolution.setOnClickListener(v -> {
             if (cameraService != null) {
                 cameraService.cycleResolution();

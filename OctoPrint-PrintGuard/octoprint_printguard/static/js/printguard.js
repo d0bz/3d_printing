@@ -58,14 +58,39 @@ $(function () {
             }
         });
 
-        setInterval(function () {
-            if (self.viewFeedMode() !== "annotated" && !document.hidden) {
-                var tabEl = $("#tab_plugin_printguard");
-                if (!tabEl.length || tabEl.is(":visible")) {
-                    self.liveFrameTimestamp(Date.now());
-                }
+        var liveTimer = null;
+        self.scheduleNextLiveFrame = function () {
+            if (liveTimer) {
+                clearTimeout(liveTimer);
+                liveTimer = null;
             }
-        }, 450);
+            if (self.viewFeedMode() === "annotated") return;
+            liveTimer = setTimeout(function () {
+                if (self.viewFeedMode() !== "annotated" && !document.hidden) {
+                    var tabEl = $("#tab_plugin_printguard");
+                    if (!tabEl.length || tabEl.is(":visible")) {
+                        self.liveFrameTimestamp(Date.now());
+                        return;
+                    }
+                }
+                self.scheduleNextLiveFrame();
+            }, 600);
+        };
+
+        self.onLiveFrameDone = function () {
+            if (self.viewFeedMode() !== "annotated") {
+                self.scheduleNextLiveFrame();
+            }
+        };
+
+        self.viewFeedMode.subscribe(function (newMode) {
+            if (newMode !== "annotated") {
+                self.liveFrameTimestamp(Date.now());
+            } else if (liveTimer) {
+                clearTimeout(liveTimer);
+                liveTimer = null;
+            }
+        });
 
         self.snapshotUrl = ko.pureComputed(function () {
             return "plugin/printguard/snapshot.jpg?t=" + self.snapshotTimestamp();

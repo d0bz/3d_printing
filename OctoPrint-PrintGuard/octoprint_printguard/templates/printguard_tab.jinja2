@@ -71,7 +71,7 @@
                     </button>
                 </div>
                 <div class="printguard-snapshot-wrapper">
-                    <img class="printguard-snapshot-img" style="cursor: zoom-in;" title="Click to enlarge" data-bind="attr: { src: activeFeedUrl }, click: toggleEnlarge" alt="PrintGuard Camera Feed" />
+                    <img class="printguard-snapshot-img" style="cursor: zoom-in;" title="Click to enlarge" data-bind="attr: { src: activeFeedUrl }, click: toggleEnlarge, event: { load: onLiveFrameDone, error: onLiveFrameDone }" alt="PrintGuard Camera Feed" />
                 </div>
                 <div class="printguard-explanation" data-bind="text: lastExplanation"></div>
             </div>
@@ -213,7 +213,9 @@
                 </div>
             </div>
             <div class="printguard-enlarge-body">
+                <!-- ko if: isEnlarged -->
                 <img class="printguard-enlarge-img" data-bind="attr: { src: activeFeedUrl }" alt="Enlarged Camera Stream" />
+                <!-- /ko -->
             </div>
         </div>
     </div>

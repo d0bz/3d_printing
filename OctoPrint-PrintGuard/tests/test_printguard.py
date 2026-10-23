@@ -264,7 +264,7 @@ def test_dual_camera_stitching_and_selection():
     frame2 = _make_clean_print_jpeg(top_y=130)
     stitched = plugin._stitch_snapshots(frame1, frame2)
     with Image.open(io.BytesIO(stitched)) as img:
-        assert img.size == (1920, 720)
+        assert img.size == (1280, 480)
     assert plugin._resolve_snapshot_url("camera1") == "http://127.0.0.1:8080/?action=snapshot"
     assert plugin._resolve_snapshot_url("camera2") == "http://127.0.0.1:8081/?action=snapshot"
 

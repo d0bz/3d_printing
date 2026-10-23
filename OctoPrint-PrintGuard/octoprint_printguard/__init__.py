@@ -110,6 +110,7 @@ class PrintGuardPlugin(
         self._detector: Optional[HybridDetector] = None
         self._notifier: Optional[NotificationManager] = None
         self._live_frame_cache: Dict[str, Any] = {}
+        self._frame_fetch_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # OctoPrint Lifecycle & Configuration
@@ -393,9 +394,9 @@ class PrintGuardPlugin(
 
     @staticmethod
     def _stitch_snapshots(*jpegs: bytes) -> bytes:
-        """Stitch two or more camera snapshots side-by-side into a single high-resolution composite JPEG."""
+        """Stitch two or more camera snapshots side-by-side into a single composite JPEG."""
         resample_fast = getattr(Image, "Resampling", Image).BILINEAR
-        panel_w, panel_h = 960, 720
+        panel_w, panel_h = 640, 480
         count = len(jpegs)
         combined = Image.new("RGB", (panel_w * count, panel_h))
         draw = ImageDraw.Draw(combined)
@@ -408,11 +409,11 @@ class PrintGuardPlugin(
                 draw.line(
                     [(idx * panel_w, 0), (idx * panel_w, panel_h)],
                     fill=(90, 140, 220),
-                    width=3,
+                    width=2,
                 )
 
         out = io.BytesIO()
-        combined.save(out, format="JPEG", quality=92)
+        combined.save(out, format="JPEG", quality=85)
         return out.getvalue()
 
     def _build_printer_context(self) -> PrinterContext:
@@ -935,7 +936,7 @@ class PrintGuardPlugin(
         choice = target_map.get(cam_id, "camera1")
         now = time.time()
         cached = self._live_frame_cache.get(choice)
-        if cached and (now - cached[0]) < 0.25:
+        if cached and (now - cached[0]) < 0.45:
             return flask.Response(
                 cached[1],
                 mimetype="image/jpeg",
@@ -943,11 +944,22 @@ class PrintGuardPlugin(
                     "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"
                 },
             )
+        # Never allow concurrent pile-up of camera HTTP requests on the Pi
+        if not self._frame_fetch_lock.acquire(blocking=False):
+            if cached:
+                return flask.Response(
+                    cached[1],
+                    mimetype="image/jpeg",
+                    headers={
+                        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"
+                    },
+                )
+            return flask.Response("Busy", status=503)
         try:
             url = self._resolve_snapshot_url(choice)
-            resp = requests.get(url, timeout=4)
+            resp = requests.get(url, timeout=2.5)
             resp.raise_for_status()
-            self._live_frame_cache[choice] = (now, resp.content)
+            self._live_frame_cache[choice] = (time.time(), resp.content)
             return flask.Response(
                 resp.content,
                 mimetype="image/jpeg",
@@ -956,6 +968,14 @@ class PrintGuardPlugin(
                 },
             )
         except Exception as exc:
+            if cached:
+                return flask.Response(
+                    cached[1],
+                    mimetype="image/jpeg",
+                    headers={
+                        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"
+                    },
+                )
             err_card = self._generate_test_card(
                 DetectionResult(
                     status=DetectionStatus.WARNING,
@@ -964,6 +984,8 @@ class PrintGuardPlugin(
                 )
             )
             return flask.Response(err_card, mimetype="image/jpeg")
+        finally:
+            self._frame_fetch_lock.release()
 
     @_blueprint_route("/PrintGuardCam.apk", methods=["GET"])
     def download_android_apk(self) -> Any:
