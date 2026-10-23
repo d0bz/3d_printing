@@ -59,10 +59,13 @@ $(function () {
         });
 
         setInterval(function () {
-            if (self.viewFeedMode() !== "annotated") {
-                self.liveFrameTimestamp(Date.now());
+            if (self.viewFeedMode() !== "annotated" && !document.hidden) {
+                var tabEl = $("#tab_plugin_printguard");
+                if (!tabEl.length || tabEl.is(":visible")) {
+                    self.liveFrameTimestamp(Date.now());
+                }
             }
-        }, 300);
+        }, 450);
 
         self.snapshotUrl = ko.pureComputed(function () {
             return "plugin/printguard/snapshot.jpg?t=" + self.snapshotTimestamp();

@@ -109,6 +109,7 @@ class PrintGuardPlugin(
 
         self._detector: Optional[HybridDetector] = None
         self._notifier: Optional[NotificationManager] = None
+        self._live_frame_cache: Dict[str, Any] = {}
 
     # ------------------------------------------------------------------
     # OctoPrint Lifecycle & Configuration
@@ -393,7 +394,7 @@ class PrintGuardPlugin(
     @staticmethod
     def _stitch_snapshots(*jpegs: bytes) -> bytes:
         """Stitch two or more camera snapshots side-by-side into a single high-resolution composite JPEG."""
-        resample_bicubic = getattr(Image, "Resampling", Image).BICUBIC
+        resample_fast = getattr(Image, "Resampling", Image).BILINEAR
         panel_w, panel_h = 960, 720
         count = len(jpegs)
         combined = Image.new("RGB", (panel_w * count, panel_h))
@@ -401,7 +402,7 @@ class PrintGuardPlugin(
 
         for idx, data in enumerate(jpegs):
             with Image.open(io.BytesIO(data)) as im:
-                rgb = im.convert("RGB").resize((panel_w, panel_h), resample_bicubic)
+                rgb = im.convert("RGB").resize((panel_w, panel_h), resample_fast)
                 combined.paste(rgb, (idx * panel_w, 0))
             if idx > 0:
                 draw.line(
@@ -932,10 +933,21 @@ class PrintGuardPlugin(
             "cam2": "camera2",
         }
         choice = target_map.get(cam_id, "camera1")
+        now = time.time()
+        cached = self._live_frame_cache.get(choice)
+        if cached and (now - cached[0]) < 0.25:
+            return flask.Response(
+                cached[1],
+                mimetype="image/jpeg",
+                headers={
+                    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"
+                },
+            )
         try:
             url = self._resolve_snapshot_url(choice)
             resp = requests.get(url, timeout=4)
             resp.raise_for_status()
+            self._live_frame_cache[choice] = (now, resp.content)
             return flask.Response(
                 resp.content,
                 mimetype="image/jpeg",
