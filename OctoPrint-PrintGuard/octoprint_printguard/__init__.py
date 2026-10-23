@@ -61,6 +61,7 @@ except ImportError:
         return fn
 
 from .detector import HybridDetector, LocalCVDetector, annotate_snapshot
+from .gcode_model import GCodeModelAnalyzer
 from .models import (
     DetectionResult,
     DetectionStatus,
@@ -111,6 +112,9 @@ class PrintGuardPlugin(
 
         self._detector: Optional[HybridDetector] = None
         self._notifier: Optional[NotificationManager] = None
+        self._gcode_analyzer = GCodeModelAnalyzer()
+        self._latest_expected_model_jpeg: Optional[bytes] = None
+        self._latest_expected_model_summary: Optional[str] = None
         self._live_frame_cache: Dict[str, Any] = {}
         self._frame_fetch_lock = threading.Lock()
         self._phone_capture_requested: bool = False
@@ -460,16 +464,23 @@ class PrintGuardPlugin(
         bed_actual = None
         bed_target = None
         filename = None
+        filepath = None
 
         if self._printer is not None:
             try:
                 is_printing = bool(self._printer.is_printing())
                 current_data = self._printer.get_current_data() or {}
+                if self._current_z is None and current_data.get("currentZ") is not None:
+                    try:
+                        self._current_z = float(current_data["currentZ"])
+                    except (TypeError, ValueError):
+                        pass
                 prog = current_data.get("progress") or {}
                 progress = float(prog.get("completion") or 0.0)
                 job = current_data.get("job") or {}
                 file_info = job.get("file") or {}
                 filename = file_info.get("name")
+                filepath = file_info.get("path") or filename
 
                 temps = self._printer.get_current_temperatures() or {}
                 if "tool0" in temps:
@@ -487,6 +498,24 @@ class PrintGuardPlugin(
             else 0.0
         )
 
+        expected_summary: Optional[str] = None
+        expected_jpeg: Optional[bytes] = None
+        try:
+            expected_state = self._gcode_analyzer.get_expected_state(
+                filepath or filename,
+                current_z=self._current_z,
+                progress_completion=progress,
+            )
+            if expected_state is not None:
+                expected_summary = expected_state.summary_text
+                expected_jpeg = expected_state.reference_jpeg
+                self._latest_expected_model_summary = expected_summary
+                self._latest_expected_model_jpeg = expected_jpeg
+                if not filename:
+                    filename = expected_state.filename
+        except Exception as exc:
+            self._logger.debug("Could not compute expected G-code model state: %s", exc)
+
         return PrinterContext(
             is_printing=is_printing,
             current_z=self._current_z,
@@ -499,6 +528,9 @@ class PrintGuardPlugin(
             bed_actual=bed_actual,
             bed_target=bed_target,
             filename=filename,
+            filepath=filepath,
+            expected_model_summary=expected_summary,
+            expected_model_jpeg=expected_jpeg,
         )
 
     # ------------------------------------------------------------------
@@ -604,7 +636,11 @@ class PrintGuardPlugin(
 
         # Annotate snapshot for UI and notifications
         try:
-            self._latest_annotated_jpeg = annotate_snapshot(raw_jpeg, result)
+            self._latest_annotated_jpeg = annotate_snapshot(
+                raw_jpeg,
+                result,
+                expected_model_jpeg=context.expected_model_jpeg,
+            )
         except Exception as exc:
             self._logger.debug("Snapshot annotation error: %s", exc)
             self._latest_annotated_jpeg = raw_jpeg
@@ -770,6 +806,7 @@ class PrintGuardPlugin(
             ),
             "current_z": self._current_z,
             "detection_mode": str(self._get_setting("detection_mode", "hybrid")),
+            "expected_model_summary": self._latest_expected_model_summary,
             "last_result": self._last_result.to_dict() if self._last_result else None,
             "has_snapshot": self._latest_annotated_jpeg is not None,
             "history": list(self._history),
@@ -986,10 +1023,33 @@ class PrintGuardPlugin(
             headers={"Cache-Control": "private, max-age=3600"},
         )
 
+    @_blueprint_route("/expected_model.jpg", methods=["GET"])
+    def get_expected_model_snapshot(self) -> Any:
+        if not self._is_logged_in():
+            return flask.Response("OctoPrint login required", status=403)
+        ctx = self._build_printer_context()
+        jpeg_bytes = ctx.expected_model_jpeg or self._latest_expected_model_jpeg
+        if jpeg_bytes is None:
+            placeholder = self._generate_test_card(
+                DetectionResult(
+                    status=DetectionStatus.OK,
+                    confidence=0.0,
+                    explanation="No active G-code file found to render expected 3D model.",
+                )
+            )
+            return flask.Response(placeholder, mimetype="image/jpeg")
+        return flask.Response(
+            jpeg_bytes,
+            mimetype="image/jpeg",
+            headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
+        )
+
     @_blueprint_route("/frame/<cam_id>.jpg", methods=["GET"])
     def get_live_camera_frame(self, cam_id: str) -> Any:
         if not self._is_logged_in():
             return flask.Response("OctoPrint login required", status=403)
+        if cam_id == "gcode":
+            return self.get_expected_model_snapshot()
         target_map = {
             "phone": "phone",
             "cam1": "camera1",

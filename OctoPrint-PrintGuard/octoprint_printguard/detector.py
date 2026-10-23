@@ -221,6 +221,8 @@ class LocalCVDetector:
             status = DetectionStatus.WARNING
         else:
             status = DetectionStatus.OK
+            if self._baseline_bed_frame is None:
+                self._baseline_bed_frame = gray.copy()
 
         if not notes:
             explanation = "Local CV check passed: normal layer structure and bed adhesion."
@@ -286,7 +288,16 @@ class LocalCVDetector:
         roi_gx = np.abs(gx[y0:y1, x0:x1])
         roi_gy = np.abs(gy[y0:y1, x0:x1])
 
-        strong_edge = roi_mag > 65.0
+        strong_edge = roi_mag > 72.0
+        # If we have a verified-clean baseline frame, subtract static printer hardware / background edges
+        if (
+            self._baseline_bed_frame is not None
+            and self._baseline_bed_frame.shape == gray.shape
+        ):
+            roi_base = self._baseline_bed_frame[y0:y1, x0:x1]
+            changed_from_base = np.abs(gray[y0:y1, x0:x1] - roi_base) > 16.0
+            strong_edge = np.logical_and(strong_edge, changed_from_base)
+
         edge_density = float(np.mean(strong_edge))
         if edge_density < 0.04:
             return 0.0, None
@@ -303,7 +314,7 @@ class LocalCVDetector:
                 cx0, cx1 = c * cell_w, (c + 1) * cell_w
                 c_edge = strong_edge[cy0:cy1, cx0:cx1]
                 c_density = float(np.mean(c_edge))
-                if c_density < 0.10:
+                if c_density < 0.12:
                     continue
 
                 c_ang = roi_ang[cy0:cy1, cx0:cx1][c_edge]
@@ -316,22 +327,22 @@ class LocalCVDetector:
                 # Also check non-horizontal edge ratio (diagonal/vertical strands)
                 c_gx = roi_gx[cy0:cy1, cx0:cx1][c_edge]
                 c_gy = roi_gy[cy0:cy1, cx0:cx1][c_edge]
-                non_layer_ratio = float(np.mean(c_gx > 0.75 * c_gy))
+                non_layer_ratio = float(np.mean(c_gx > 0.78 * c_gy))
 
-                if entropy >= 2.35 and non_layer_ratio >= 0.35 and c_density >= 0.14:
+                if entropy >= 2.42 and non_layer_ratio >= 0.38 and c_density >= 0.15:
                     cell_score = min(
                         1.0,
                         (c_density / 0.32) * (entropy / 2.8) * (non_layer_ratio / 0.55),
                     )
                     chaotic_cells.append((r, c, cell_score))
 
-        if not chaotic_cells:
+        if len(chaotic_cells) < 2:
             return 0.0, None
 
         # Aggregate score from chaotic cells
         mean_top = float(np.mean([s for _, _, s in chaotic_cells]))
-        coverage_factor = min(1.0, len(chaotic_cells) / 3.0)
-        score = float(min(1.0, mean_top * (0.45 + 0.55 * coverage_factor)))
+        coverage_factor = min(1.0, len(chaotic_cells) / 3.5)
+        score = float(min(1.0, mean_top * (0.40 + 0.60 * coverage_factor)))
 
         # Compute bounding box around chaotic cells
         min_r = min(r for r, _, _ in chaotic_cells)
@@ -671,6 +682,12 @@ class HybridDetector:
                 except Exception as exc:
                     logger.warning("Hybrid Vision AI check failed, using local CV result: %s", exc)
                     local_result.explanation = f"{local_result.explanation} [Vision AI Error: {exc}]"
+                    # Do not auto-pause a print on an unconfirmed local CV score when Vision AI timed out
+                    if local_result.status == DetectionStatus.FAILURE:
+                        local_result.status = DetectionStatus.WARNING
+                        local_result.confidence = min(
+                            local_result.confidence, self.failure_threshold - 0.05
+                        )
             elif force_vision_ai:
                 local_result.explanation = (
                     f"{local_result.explanation} [Vision AI API key not saved yet — open Settings -> PrintGuard and click Save]"
@@ -682,34 +699,37 @@ class HybridDetector:
     def _merge_results(
         self, local_res: DetectionResult, ai_res: DetectionResult
     ) -> DetectionResult:
-        """Fuse local CV and Vision AI detection scores and explanations."""
-        # Weight Vision AI slightly higher (0.65) when available, while preserving strong local signals
+        """Fuse local CV and Vision AI detection scores and explanations, trusting Vision AI against false positives."""
+
+        def _fuse(ai_val: float, local_val: float) -> float:
+            # When Vision AI explicitly sees a clean print (ai_val < 0.20), suppress local edge noise
+            if ai_val < 0.20:
+                return min(0.18, 0.85 * ai_val + 0.15 * local_val)
+            return max(ai_val, 0.80 * ai_val + 0.20 * local_val)
+
         merged_scores = SubScores(
-            no_extrusion=max(
-                ai_res.sub_scores.no_extrusion,
-                0.65 * ai_res.sub_scores.no_extrusion + 0.35 * local_res.sub_scores.no_extrusion,
-            ),
-            bed_detachment=max(
-                ai_res.sub_scores.bed_detachment,
-                0.65 * ai_res.sub_scores.bed_detachment + 0.35 * local_res.sub_scores.bed_detachment,
-            ),
-            spaghetti=max(
-                ai_res.sub_scores.spaghetti,
-                0.65 * ai_res.sub_scores.spaghetti + 0.35 * local_res.sub_scores.spaghetti,
-            ),
+            no_extrusion=_fuse(ai_res.sub_scores.no_extrusion, local_res.sub_scores.no_extrusion),
+            bed_detachment=_fuse(ai_res.sub_scores.bed_detachment, local_res.sub_scores.bed_detachment),
+            spaghetti=_fuse(ai_res.sub_scores.spaghetti, local_res.sub_scores.spaghetti),
             layer_shift=ai_res.sub_scores.layer_shift,
-            nozzle_blob=max(
-                ai_res.sub_scores.nozzle_blob,
-                0.65 * ai_res.sub_scores.nozzle_blob + 0.35 * local_res.sub_scores.nozzle_blob,
-            ),
+            nozzle_blob=_fuse(ai_res.sub_scores.nozzle_blob, local_res.sub_scores.nozzle_blob),
         )
 
+        score_map = {
+            FailureType.NO_EXTRUSION.value: merged_scores.no_extrusion,
+            FailureType.BED_DETACHMENT.value: merged_scores.bed_detachment,
+            FailureType.SPAGHETTI.value: merged_scores.spaghetti,
+            FailureType.LAYER_SHIFT.value: merged_scores.layer_shift,
+            FailureType.NOZZLE_BLOB.value: merged_scores.nozzle_blob,
+        }
         combined_conf = max(
-            ai_res.confidence,
-            0.65 * ai_res.confidence + 0.35 * local_res.confidence,
+            ai_res.confidence if ai_res.status != DetectionStatus.OK else 0.0,
+            max(score_map.values()),
         )
 
-        merged_types = list(dict.fromkeys(ai_res.failure_types + local_res.failure_types))
+        merged_types = [
+            ft for ft, s in score_map.items() if s >= self.warning_threshold or ft in ai_res.failure_types
+        ]
         if combined_conf >= self.failure_threshold:
             status = DetectionStatus.FAILURE
         elif combined_conf >= self.warning_threshold:
@@ -718,7 +738,12 @@ class HybridDetector:
             status = DetectionStatus.OK
             merged_types = []
 
-        bboxes = ai_res.bounding_boxes if ai_res.bounding_boxes else local_res.bounding_boxes
+        if status == DetectionStatus.OK:
+            bboxes = []
+        elif ai_res.bounding_boxes:
+            bboxes = ai_res.bounding_boxes
+        else:
+            bboxes = [b for b in local_res.bounding_boxes if b.label in merged_types]
         explanation = f"[Hybrid AI+CV] {ai_res.explanation}"
 
         return DetectionResult(
@@ -739,6 +764,14 @@ class HybridDetector:
         result: DetectionResult,
     ) -> None:
         """Keep an earlier healthy reference frame so Vision AI can compare Z growth & bed shift."""
+        if result.status == DetectionStatus.OK and self.local_detector._baseline_bed_frame is None:
+            try:
+                self.local_detector._baseline_bed_frame = rgb_to_gray(
+                    decode_image_to_rgb(current_jpeg)
+                )
+            except Exception:
+                pass
+
         if self._reference_jpeg is None:
             self._reference_jpeg = current_jpeg
             self._reference_z = context.current_z if context else None
@@ -750,10 +783,14 @@ class HybridDetector:
                 self._reference_z = context.current_z
 
 
-def annotate_snapshot(image_bytes: bytes, result: DetectionResult) -> bytes:
+def annotate_snapshot(
+    image_bytes: bytes,
+    result: DetectionResult,
+    expected_model_jpeg: Optional[bytes] = None,
+) -> bytes:
     """
-    Draw status header, confidence score, failure labels, and defect bounding boxes
-    onto the camera snapshot JPEG for the OctoPrint UI and webhook alerts.
+    Draw status header, confidence score, failure labels, defect bounding boxes,
+    and optional Expected G-Code Model PiP overlay onto the camera snapshot JPEG.
     """
     with Image.open(io.BytesIO(image_bytes)) as img:
         canvas = img.convert("RGB")
@@ -783,6 +820,25 @@ def annotate_snapshot(image_bytes: bytes, result: DetectionResult) -> bytes:
             draw.rectangle([x0, max(0, y0 - 16), min(w, x0 + len(caption) * 6 + 8), y0], fill=banner_color)
             draw.text((x0 + 4, max(0, y0 - 14)), caption, fill=(255, 255, 255), font=font)
 
+        # Composite Expected G-Code Model PiP overlay in bottom-right corner if available
+        if expected_model_jpeg and w >= 400 and h >= 240:
+            try:
+                with Image.open(io.BytesIO(expected_model_jpeg)) as pip_img:
+                    pip_w = min(260, max(160, w // 4))
+                    pip_h = int(pip_w * 0.75)
+                    resample = getattr(Image, "Resampling", Image).BILINEAR
+                    pip_rgb = pip_img.convert("RGB").resize((pip_w, pip_h), resample)
+                    px = w - pip_w - 8
+                    py = h - pip_h - 8
+                    draw.rectangle(
+                        [px - 2, py - 2, px + pip_w + 1, py + pip_h + 1],
+                        outline=(88, 166, 255),
+                        width=2,
+                    )
+                    canvas.paste(pip_rgb, (px, py))
+            except Exception:
+                pass
+
         # Draw top status bar
         banner_h = 24
         draw.rectangle([0, 0, w, banner_h], fill=banner_color)
@@ -794,5 +850,5 @@ def annotate_snapshot(image_bytes: bytes, result: DetectionResult) -> bytes:
         draw.text((8, 6), header_text, fill=(255, 255, 255), font=font)
 
         out = io.BytesIO()
-        canvas.save(out, format="JPEG", quality=92)
+        canvas.save(out, format="JPEG", quality=90)
         return out.getvalue()

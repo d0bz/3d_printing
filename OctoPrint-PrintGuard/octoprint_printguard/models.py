@@ -65,9 +65,14 @@ class PrinterContext:
     bed_actual: Optional[float] = None
     bed_target: Optional[float] = None
     filename: Optional[str] = None
+    filepath: Optional[str] = None
+    expected_model_summary: Optional[str] = None
+    expected_model_jpeg: Optional[bytes] = field(default=None, repr=False)
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        d.pop("expected_model_jpeg", None)
+        return d
 
 
 @dataclass

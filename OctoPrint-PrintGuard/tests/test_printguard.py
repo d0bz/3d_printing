@@ -16,6 +16,7 @@ from octoprint_printguard.detector import (
     LocalCVDetector,
     annotate_snapshot,
 )
+from octoprint_printguard.gcode_model import GCodeModelAnalyzer
 from octoprint_printguard.models import (
     DetectionResult,
     DetectionStatus,
@@ -267,4 +268,114 @@ def test_dual_camera_stitching_and_selection():
         assert img.size == (1280, 480)
     assert plugin._resolve_snapshot_url("camera1") == "http://127.0.0.1:8080/?action=snapshot"
     assert plugin._resolve_snapshot_url("camera2") == "http://127.0.0.1:8081/?action=snapshot"
+
+
+def test_gcode_model_analyzer_parses_and_renders_expected_model_at_z(tmp_path):
+    gcode_content = """
+;Generated with Cura_SteamEngine 4.9.1
+;Layer height: 0.2
+M82
+G1 X10.1 Y20.0 Z0.28 F5000.0
+G1 X10.1 Y200.0 Z0.28 F1500.0 E15 ; prime line (must be ignored)
+G92 E0
+;LAYER_COUNT:3
+;LAYER:0
+@Object calibration_cube.stl
+G0 X90.0 Y90.0 Z0.2
+;TYPE:WALL-OUTER
+G1 X130.0 Y90.0 E1.2
+G1 X130.0 Y130.0 E2.4
+G1 X90.0 Y130.0 E3.6
+G1 X90.0 Y90.0 E4.8
+;LAYER:1
+G0 X90.0 Y90.0 Z0.4
+;TYPE:WALL-OUTER
+G1 X130.0 Y90.0 E6.0
+G1 X130.0 Y130.0 E7.2
+G1 X90.0 Y130.0 E8.4
+G1 X90.0 Y90.0 E9.6
+;LAYER:2
+G0 X95.0 Y95.0 Z0.6
+;TYPE:WALL-OUTER
+G1 X125.0 Y95.0 E10.5
+G1 X125.0 Y125.0 E11.4
+G1 X95.0 Y125.0 E12.3
+G1 X95.0 Y95.0 E13.2
+"""
+    gcode_file = tmp_path / "cube.gcode"
+    gcode_file.write_text(gcode_content.strip(), encoding="utf-8")
+
+    analyzer = GCodeModelAnalyzer(uploads_dir=str(tmp_path))
+    state = analyzer.get_expected_state("cube.gcode", current_z=0.4)
+    assert state is not None
+    assert state.object_name == "calibration_cube.stl"
+    assert state.total_layers == 3
+    assert state.completed_layers == 2
+    assert state.width_mm == pytest.approx(40.0)
+    assert state.depth_mm == pytest.approx(40.0)
+    assert "40.0mm wide" in state.summary_text
+    with Image.open(io.BytesIO(state.reference_jpeg)) as ref_img:
+        assert ref_img.size == (640, 480)
+
+    # Verify PiP composite on annotated snapshot
+    annotated = annotate_snapshot(
+        _make_clean_print_jpeg(),
+        DetectionResult(status=DetectionStatus.OK, confidence=0.05, explanation="Clean print"),
+        expected_model_jpeg=state.reference_jpeg,
+    )
+    with Image.open(io.BytesIO(annotated)) as ann_img:
+        assert ann_img.size == (320, 240)
+
+
+@patch("octoprint_printguard.vision_providers.requests.post")
+def test_hybrid_suppresses_false_spaghetti_when_vision_ai_confirms_ok(mock_post):
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {
+        "candidates": [
+            {
+                "content": {
+                    "parts": [
+                        {
+                            "text": json.dumps(
+                                {
+                                    "status": "ok",
+                                    "confidence": 0.04,
+                                    "failure_types": [],
+                                    "sub_scores": {
+                                        "no_extrusion": 0.0,
+                                        "bed_detachment": 0.0,
+                                        "spaghetti": 0.04,
+                                        "layer_shift": 0.0,
+                                        "nozzle_blob": 0.0,
+                                    },
+                                    "explanation": "Print on bed matches expected G-code model at current Z; background cables ignored.",
+                                    "bounding_boxes": [],
+                                }
+                            )
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+    mock_post.return_value = mock_resp
+
+    vision_client = VisionAIClient(
+        provider="gemini", api_key="test-key", model="gemini-2.5-flash"
+    )
+    hybrid = HybridDetector(
+        mode="hybrid",
+        vision_client=vision_client,
+        escalation_threshold=0.35,
+    )
+
+    # Feed a noisy frame that triggers local CV spaghetti heuristics, but Gemini confirms OK
+    spag_jpeg = _make_spaghetti_jpeg()
+    res = hybrid.analyze(spag_jpeg, PrinterContext(is_printing=True, current_z=4.2))
+    assert res.status == DetectionStatus.OK
+    assert res.sub_scores.spaghetti <= 0.18
+    assert res.failure_types == []
+    assert res.bounding_boxes == []
+
 

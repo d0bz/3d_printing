@@ -33,6 +33,7 @@ $(function () {
         self.lastStatus = ko.observable("ok");
         self.overallConfidence = ko.observable(0.0);
         self.lastExplanation = ko.observable("Waiting for camera inspection...");
+        self.expectedModelSummary = ko.observable("");
         self.scoreNoExtrusion = ko.observable(0.0);
         self.scoreBedDetachment = ko.observable(0.0);
         self.scoreSpaghetti = ko.observable(0.0);
@@ -79,9 +80,9 @@ $(function () {
                 clearTimeout(liveTimer);
                 liveTimer = null;
             }
-            if (self.viewFeedMode() === "annotated") return;
+            if (self.viewFeedMode() === "annotated" || self.viewFeedMode() === "gcode") return;
             liveTimer = setTimeout(function () {
-                if (self.viewFeedMode() !== "annotated" && !document.hidden) {
+                if (self.viewFeedMode() !== "annotated" && self.viewFeedMode() !== "gcode" && !document.hidden) {
                     var tabEl = $("#tab_plugin_printguard");
                     if (!tabEl.length || tabEl.is(":visible")) {
                         self.liveFrameTimestamp(Date.now());
@@ -93,17 +94,22 @@ $(function () {
         };
 
         self.onLiveFrameDone = function () {
-            if (self.viewFeedMode() !== "annotated") {
+            if (self.viewFeedMode() !== "annotated" && self.viewFeedMode() !== "gcode") {
                 self.scheduleNextLiveFrame();
             }
         };
 
         self.viewFeedMode.subscribe(function (newMode) {
-            if (newMode !== "annotated") {
+            if (newMode !== "annotated" && newMode !== "gcode") {
                 self.liveFrameTimestamp(Date.now());
-            } else if (liveTimer) {
-                clearTimeout(liveTimer);
-                liveTimer = null;
+            } else {
+                if (newMode === "gcode") {
+                    self.snapshotTimestamp(Date.now());
+                }
+                if (liveTimer) {
+                    clearTimeout(liveTimer);
+                    liveTimer = null;
+                }
             }
         });
 
@@ -113,6 +119,9 @@ $(function () {
 
         self.activeFeedUrl = ko.pureComputed(function () {
             var mode = self.viewFeedMode();
+            if (mode === "gcode") {
+                return "plugin/printguard/expected_model.jpg?t=" + self.snapshotTimestamp();
+            }
             if (mode === "phone" || mode === "cam1" || mode === "cam2") {
                 return "plugin/printguard/frame/" + mode + ".jpg?t=" + self.liveFrameTimestamp();
             }
@@ -209,6 +218,9 @@ $(function () {
             self.consecutiveThreshold(data.consecutive_failures_threshold || 2);
             self.currentZ(data.current_z);
             self.detectionMode(data.detection_mode || "hybrid");
+            if (data.expected_model_summary !== undefined) {
+                self.expectedModelSummary(data.expected_model_summary || "");
+            }
             if (data.history) {
                 self.history(data.history);
             }

@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import logging
 import re
 from typing import Any, Dict, List, Optional
+from PIL import Image
 import requests
 
 from .models import (
@@ -20,14 +22,22 @@ from .models import (
 logger = logging.getLogger("octoprint.plugins.printguard.vision")
 
 SYSTEM_PROMPT = """You are an expert 3D printing quality control and failure detection vision system.
-Analyze the provided 3D printer camera snapshot(s) and printer telemetry to detect any active print failures.
-If two images are provided, the first image is an earlier reference frame and the second image is the current frame.
+Analyze the provided 3D printer camera snapshot(s), the Expected G-Code Model at Current Z (if provided), and printer telemetry to detect any active print failures.
+When multiple images are provided:
+- If an "Expected G-Code Model" diagram (3D isometric + front profile + top-down footprint at current Z) is included, compare the physical object on the print bed against the expected model shape, footprint dimensions, and current Z height progression.
+- The final image is always the live camera snapshot(s) of the print bed.
+
+CRITICAL ANTI-FALSE-POSITIVE RULES:
+- Do NOT confuse 3D printer hardware (frame rails, belts, wiring, hotend cables, build plate text/grid, or the left-edge prime/purge line) with "spaghetti".
+- Do NOT confuse normal geometric infill (grid/gyroid/lines) or clean layer walls with "spaghetti".
+- Only score "spaghetti" > 0.25 if you clearly see chaotic, unattached, tangled loops/strands of extruded plastic piling up randomly or hanging in mid-air.
+- If the printer is not currently printing or the bed matches the expected state for the current Z height, return status="ok" and sub_scores near 0.0.
 
 Specifically inspect for these failure modes:
-1. "no_extrusion": Filament is not coming out of the nozzle (air printing, clogged nozzle, tangled spool, or print height is no longer growing despite Z-axis height increasing). Look for a visible gap between the nozzle tip and the top of the printed part, or zero part growth across Z increases.
-2. "bed_detachment": The print is coming off the build plate, corners/edges are warping or curling upward, or the entire object has detached/shifted from its original footprint on the bed.
-3. "spaghetti": Extruded filament is forming chaotic, tangled, stringy spaghetti strands in mid-air or around the model instead of structured layers.
-4. "layer_shift": The upper layers of the print are horizontally offset/shifted relative to the lower layers.
+1. "no_extrusion": Filament is not coming out of the nozzle (air printing, clogged nozzle, or part height on the bed is much shorter than the Expected G-Code Model at Current Z). Look for a visible gap between the nozzle tip and the top of the printed part.
+2. "bed_detachment": The print is coming off the build plate, corners/edges are warping or curling upward, or the object has detached/shifted from its expected footprint on the bed.
+3. "spaghetti": Extruded filament is forming chaotic, tangled, unattached spaghetti strands in mid-air or around the model instead of structured layers matching the G-code model.
+4. "layer_shift": The upper layers of the print are horizontally offset/shifted relative to the lower layers compared to the Expected G-Code Model.
 5. "nozzle_blob": A large molten blob/mass of plastic is accumulating around the hotend/nozzle block.
 
 Respond ONLY with a valid JSON object matching this exact schema:
@@ -42,7 +52,7 @@ Respond ONLY with a valid JSON object matching this exact schema:
     "layer_shift": <float 0.0 to 1.0>,
     "nozzle_blob": <float 0.0 to 1.0>
   },
-  "explanation": "<concise 1-2 sentence explanation of what is observed>",
+  "explanation": "<concise 1-2 sentence explanation comparing what is on the bed with the expected G-code model at current Z>",
   "bounding_boxes": [
     {
       "x_min": <float 0.0 to 1.0>,
@@ -57,9 +67,11 @@ Respond ONLY with a valid JSON object matching this exact schema:
 
 
 def build_user_prompt(context: Optional[PrinterContext] = None, local_hint: Optional[DetectionResult] = None) -> str:
-    lines = ["Inspect the 3D printer camera frame(s) and return the JSON diagnostic assessment."]
+    lines = ["Inspect the 3D printer camera frame(s) and compare the print bed against the expected G-code model state."]
     if context:
-        telemetry = []
+        telemetry = [f"Printing active: {'YES' if context.is_printing else 'NO (Idle/Standby)'}"]
+        if context.filename:
+            telemetry.append(f"G-code file: {context.filename}")
         if context.current_z is not None:
             telemetry.append(f"Current Z height: {context.current_z:.2f} mm")
         if context.previous_z is not None:
@@ -78,12 +90,13 @@ def build_user_prompt(context: Optional[PrinterContext] = None, local_hint: Opti
             telemetry.append(f"Print progress: {context.progress_completion:.1f}%")
         if telemetry:
             lines.append("Printer Telemetry: " + " | ".join(telemetry))
+        if context.expected_model_summary:
+            lines.append("Expected G-Code Model Geometry at Current Z: " + context.expected_model_summary)
 
-    if local_hint and local_hint.confidence > 0.15:
+    if local_hint and (local_hint.sub_scores.no_extrusion >= 0.45 or local_hint.sub_scores.bed_detachment >= 0.45):
         lines.append(
-            f"Local CV Pre-Check Hint: confidence={local_hint.confidence:.2f}, "
-            f"suspected={local_hint.failure_types}, sub_scores={local_hint.sub_scores.to_dict()}, "
-            f"note='{local_hint.explanation}'"
+            f"Local Geometry Check Note: no_extrusion={local_hint.sub_scores.no_extrusion:.2f}, "
+            f"bed_detachment={local_hint.sub_scores.bed_detachment:.2f} ({local_hint.explanation})"
         )
     return "\n".join(lines)
 
@@ -185,6 +198,23 @@ class VisionAIClient:
             return "llava"
         return "gemini-2.5-flash"
 
+    @staticmethod
+    def _compress_for_api(jpeg_bytes: bytes, max_width: int = 800) -> bytes:
+        """Downscale large snapshots before base64 encoding so Vision API calls stay fast and never time out."""
+        try:
+            with Image.open(io.BytesIO(jpeg_bytes)) as img:
+                w, h = img.size
+                if w > max_width:
+                    new_h = max(1, int(h * (max_width / float(w))))
+                    resample = getattr(Image, "Resampling", Image).BILINEAR
+                    img = img.convert("RGB").resize((max_width, new_h), resample)
+                    out = io.BytesIO()
+                    img.save(out, format="JPEG", quality=82)
+                    return out.getvalue()
+        except Exception:
+            pass
+        return jpeg_bytes
+
     def analyze(
         self,
         current_jpeg: bytes,
@@ -192,14 +222,22 @@ class VisionAIClient:
         context: Optional[PrinterContext] = None,
         local_hint: Optional[DetectionResult] = None,
     ) -> DetectionResult:
-        """Analyze current snapshot (and optional reference snapshot) via configured provider."""
+        """Analyze current snapshot (and optional expected G-code model / reference snapshot) via configured provider."""
         user_prompt = build_user_prompt(context=context, local_hint=local_hint)
+        ref_img = (
+            context.expected_model_jpeg
+            if (context and context.expected_model_jpeg)
+            else reference_jpeg
+        )
+        compact_cur = self._compress_for_api(current_jpeg, max_width=800)
+        compact_ref = self._compress_for_api(ref_img, max_width=640) if ref_img else None
+
         if self.provider == "gemini":
-            raw_text = self._call_gemini(current_jpeg, reference_jpeg, user_prompt)
+            raw_text = self._call_gemini(compact_cur, compact_ref, user_prompt)
         elif self.provider == "openai":
-            raw_text = self._call_openai(current_jpeg, reference_jpeg, user_prompt)
+            raw_text = self._call_openai(compact_cur, compact_ref, user_prompt)
         elif self.provider == "ollama":
-            raw_text = self._call_ollama(current_jpeg, reference_jpeg, user_prompt)
+            raw_text = self._call_ollama(compact_cur, compact_ref, user_prompt)
         else:
             raise ValueError(f"Unsupported Vision AI provider: {self.provider}")
 
@@ -252,16 +290,19 @@ class VisionAIClient:
                 "responseMimeType": "application/json",
             },
         }
-        resp = requests.post(url, json=payload, timeout=self.timeout)
+        req_timeout = max(25, int(self.timeout))
+        resp = requests.post(url, json=payload, timeout=req_timeout)
         if resp.status_code == 404 and model_id != "gemini-2.5-flash":
             logger.warning(
-                "Gemini model '%s' returned 404; retrying with 'gemini-2.5-flash'",
+                "Gemini model '%s' returned 404; caching and retrying with 'gemini-2.5-flash'",
                 model_id,
             )
+            self.model = "gemini-2.5-flash"
+            model_id = "gemini-2.5-flash"
             fallback_url = (
                 f"{base_url}/models/gemini-2.5-flash:generateContent?key={self.api_key.strip()}"
             )
-            resp = requests.post(fallback_url, json=payload, timeout=self.timeout)
+            resp = requests.post(fallback_url, json=payload, timeout=req_timeout)
         if not resp.ok:
             raise RuntimeError(
                 f"Gemini API HTTP {resp.status_code} ({model_id}): {resp.text[:250]}"
