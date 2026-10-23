@@ -32,14 +32,18 @@ import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.Inet4Address;
 import java.net.InetAddress;
+import java.net.HttpURLConnection;
 import java.net.NetworkInterface;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -71,7 +75,9 @@ public class CameraServerService extends Service implements Camera.PreviewCallba
     private final AtomicBoolean isRunning = new AtomicBoolean(false);
     private final AtomicReference<byte[]> latestJpeg = new AtomicReference<>(null);
     private final AtomicLong frameCounter = new AtomicLong(0);
+    private final AtomicLong triggeredCaptures = new AtomicLong(0);
     private final AtomicInteger activeClients = new AtomicInteger(0);
+    private volatile String octoprintBaseUrl = "http://192.168.0.20";
 
     public static class LocalBinder extends Binder {
         private final CameraServerService service;
@@ -97,6 +103,7 @@ public class CameraServerService extends Service implements Camera.PreviewCallba
             startForegroundServiceInternal();
             startCameraCapture();
             startHttpServer(DEFAULT_PORT);
+            startOctoPrintTriggerPoller();
         }
         return START_STICKY;
     }
@@ -148,11 +155,22 @@ public class CameraServerService extends Service implements Camera.PreviewCallba
         return previewHeight;
     }
 
+    public long getTriggeredCapturesCount() {
+        return triggeredCaptures.get();
+    }
+
+    public void setOctoprintBaseUrl(String url) {
+        if (url != null && !url.trim().isEmpty()) {
+            octoprintBaseUrl = url.trim().replaceAll("/+$", "");
+        }
+    }
+
     public void startStreaming() {
         if (!isRunning.get()) {
             startForegroundServiceInternal();
             startCameraCapture();
             startHttpServer(DEFAULT_PORT);
+            startOctoPrintTriggerPoller();
         }
     }
 
@@ -380,6 +398,112 @@ public class CameraServerService extends Service implements Camera.PreviewCallba
         return previewWidth + "x" + previewHeight;
     }
 
+    public byte[] captureFocusedPhoto() {
+        try {
+            synchronized (this) {
+                if (camera != null) {
+                    Camera.Parameters params = camera.getParameters();
+                    List<String> focusModes = params.getSupportedFocusModes();
+                    if (focusModes != null && focusModes.contains(Camera.Parameters.FOCUS_MODE_AUTO)) {
+                        params.setFocusMode(Camera.Parameters.FOCUS_MODE_AUTO);
+                        camera.setParameters(params);
+                    }
+                    final CountDownLatch latch = new CountDownLatch(1);
+                    try {
+                        camera.cancelAutoFocus();
+                        camera.autoFocus((success, cam) -> latch.countDown());
+                        latch.await(1200, TimeUnit.MILLISECONDS);
+                    } catch (Exception ignored) {
+                    }
+                }
+            }
+            // Wait briefly after focus lock so the newly focused preview frame is encoded
+            Thread.sleep(150);
+            synchronized (this) {
+                if (camera != null) {
+                    try {
+                        camera.cancelAutoFocus();
+                        Camera.Parameters params = camera.getParameters();
+                        List<String> focusModes = params.getSupportedFocusModes();
+                        if (focusModes != null && focusModes.contains(Camera.Parameters.FOCUS_MODE_CONTINUOUS_VIDEO)) {
+                            params.setFocusMode(Camera.Parameters.FOCUS_MODE_CONTINUOUS_VIDEO);
+                            camera.setParameters(params);
+                        }
+                    } catch (Exception ignored) {
+                    }
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "AutoFocus capture warning: " + e.getMessage());
+        }
+        triggeredCaptures.incrementAndGet();
+        byte[] jpeg = latestJpeg.get();
+        return jpeg != null ? jpeg : createPlaceholderJpeg("Capturing...");
+    }
+
+    private void startOctoPrintTriggerPoller() {
+        Thread pollThread = new Thread(() -> {
+            while (isRunning.get()) {
+                try {
+                    String base = octoprintBaseUrl;
+                    String phoneIp = getLocalIpAddress(CameraServerService.this);
+                    URL pollUrl = new URL(base + "/plugin/printguard/phone_poll?ip=" + phoneIp + "&port=" + DEFAULT_PORT);
+                    HttpURLConnection conn = (HttpURLConnection) pollUrl.openConnection();
+                    conn.setConnectTimeout(2500);
+                    conn.setReadTimeout(2500);
+                    conn.setRequestMethod("GET");
+                    int code = conn.getResponseCode();
+                    if (code == 200) {
+                        BufferedReader br = new BufferedReader(
+                                new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8)
+                        );
+                        StringBuilder sb = new StringBuilder();
+                        String line;
+                        while ((line = br.readLine()) != null) {
+                            sb.append(line);
+                        }
+                        br.close();
+                        if (sb.toString().contains("\"capture_requested\":true")
+                                || sb.toString().contains("\"capture_requested\": true")) {
+                            byte[] focusedJpeg = captureFocusedPhoto();
+                            uploadFocusedFrameToOctoPrint(base, focusedJpeg);
+                        }
+                    }
+                    conn.disconnect();
+                } catch (Exception ignored) {
+                }
+                try {
+                    Thread.sleep(2500);
+                } catch (InterruptedException ie) {
+                    break;
+                }
+            }
+        }, "PrintGuardTriggerPoll");
+        pollThread.setDaemon(true);
+        pollThread.start();
+    }
+
+    private void uploadFocusedFrameToOctoPrint(String base, byte[] jpegBytes) {
+        if (jpegBytes == null || jpegBytes.length == 0) return;
+        try {
+            URL uploadUrl = new URL(base + "/plugin/printguard/upload_phone_frame");
+            HttpURLConnection up = (HttpURLConnection) uploadUrl.openConnection();
+            up.setConnectTimeout(4000);
+            up.setReadTimeout(4000);
+            up.setRequestMethod("POST");
+            up.setRequestProperty("Content-Type", "image/jpeg");
+            up.setDoOutput(true);
+            OutputStream os = up.getOutputStream();
+            os.write(jpegBytes);
+            os.flush();
+            os.close();
+            up.getResponseCode();
+            up.disconnect();
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to push focused frame: " + e.getMessage());
+        }
+    }
+
     @Override
     public void onPreviewFrame(byte[] data, Camera cam) {
         if (data == null || cam == null) {
@@ -483,7 +607,19 @@ public class CameraServerService extends Service implements Camera.PreviewCallba
             String fullPath = parts.length > 1 ? parts[1] : "/";
             OutputStream out = socket.getOutputStream();
 
-            if (fullPath.contains("action=snapshot")
+            if (fullPath.startsWith("/capture") || fullPath.contains("action=capture")) {
+                byte[] jpeg = captureFocusedPhoto();
+                String headers = "HTTP/1.1 200 OK\r\n"
+                        + "Content-Type: image/jpeg\r\n"
+                        + "Content-Length: " + jpeg.length + "\r\n"
+                        + "Access-Control-Allow-Origin: *\r\n"
+                        + "Cache-Control: no-store, no-cache, must-revalidate, max-age=0\r\n"
+                        + "Connection: close\r\n\r\n";
+                out.write(headers.getBytes(StandardCharsets.UTF_8));
+                out.write(jpeg);
+                out.flush();
+
+            } else if (fullPath.contains("action=snapshot")
                     || fullPath.startsWith("/shot.jpg")
                     || fullPath.startsWith("/snapshot")) {
                 byte[] jpeg = latestJpeg.get();

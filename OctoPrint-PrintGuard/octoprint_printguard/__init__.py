@@ -111,6 +111,10 @@ class PrintGuardPlugin(
         self._notifier: Optional[NotificationManager] = None
         self._live_frame_cache: Dict[str, Any] = {}
         self._frame_fetch_lock = threading.Lock()
+        self._phone_capture_requested: bool = False
+        self._phone_capture_event = threading.Event()
+        self._latest_phone_pushed_jpeg: Optional[bytes] = None
+        self._latest_phone_pushed_ts: float = 0.0
 
     # ------------------------------------------------------------------
     # OctoPrint Lifecycle & Configuration
@@ -352,6 +356,42 @@ class PrintGuardPlugin(
             or str(self._get_setting("phone_snapshot_url", "")).strip()
         )
 
+    def _fetch_single_source_snapshot(self, source: str) -> bytes:
+        """Fetch a snapshot for a single camera source; for 'phone', trigger autofocus capture and support phone push."""
+        if source == "phone":
+            self._phone_capture_requested = True
+            self._phone_capture_event.clear()
+            phone_ip = str(self._get_setting("phone_camera_ip", "")).strip()
+            phone_port = int(self._get_setting("phone_camera_port", 8080) or 8080)
+            capture_url = (
+                f"http://{phone_ip}:{phone_port}/capture"
+                if phone_ip
+                else self._resolve_snapshot_url("phone")
+            )
+            try:
+                r = requests.get(capture_url, timeout=4.5)
+                r.raise_for_status()
+                self._phone_capture_requested = False
+                self._latest_phone_pushed_jpeg = r.content
+                self._latest_phone_pushed_ts = time.time()
+                self._live_frame_cache["phone"] = (time.time(), r.content)
+                return r.content
+            except Exception as direct_exc:
+                # Wait for phone's outbound poll (/phone_poll -> autoFocus -> /upload_phone_frame)
+                if self._phone_capture_event.wait(timeout=6.0) and self._latest_phone_pushed_jpeg:
+                    return self._latest_phone_pushed_jpeg
+                if (
+                    self._latest_phone_pushed_jpeg
+                    and (time.time() - self._latest_phone_pushed_ts) < 30.0
+                ):
+                    return self._latest_phone_pushed_jpeg
+                raise direct_exc
+
+        u = self._resolve_snapshot_url(source)
+        r = requests.get(u, timeout=6)
+        r.raise_for_status()
+        return r.content
+
     def fetch_snapshot(self) -> bytes:
         """Fetch raw JPEG snapshot bytes from the selected camera(s) and stitch if multi-camera is selected."""
         choice = str(self._get_setting("active_camera", "camera1")).strip()
@@ -371,10 +411,7 @@ class PrintGuardPlugin(
             last_err: Optional[Exception] = None
             for src in sources:
                 try:
-                    u = self._resolve_snapshot_url(src)
-                    r = requests.get(u, timeout=6)
-                    r.raise_for_status()
-                    frames.append(r.content)
+                    frames.append(self._fetch_single_source_snapshot(src))
                 except Exception as exc:
                     last_err = exc
                     self._logger.debug("Multi-cam source '%s' unavailable: %s", src, exc)
@@ -387,10 +424,7 @@ class PrintGuardPlugin(
                 return frames[0]
             return self._stitch_snapshots(*frames)
 
-        url = self._resolve_snapshot_url(choice)
-        resp = requests.get(url, timeout=8)
-        resp.raise_for_status()
-        return resp.content
+        return self._fetch_single_source_snapshot(choice)
 
     @staticmethod
     def _stitch_snapshots(*jpegs: bytes) -> bytes:
@@ -1048,6 +1082,34 @@ class PrintGuardPlugin(
                 "stream_url": f"http://{phone_ip}:{phone_port}/?action=stream",
             }
         )
+
+    @_blueprint_route("/phone_poll", methods=["GET", "POST"])
+    def phone_poll_trigger(self) -> Any:
+        """Polled by the Android phone app every few seconds to check if PrintGuard wants a focused photo."""
+        if not (self._is_logged_in() or self._is_direct_local_lan()):
+            return flask.Response("OctoPrint login required", status=403)
+        return flask.jsonify(
+            {
+                "ok": True,
+                "capture_requested": bool(self._phone_capture_requested),
+            }
+        )
+
+    @_blueprint_route("/upload_phone_frame", methods=["POST"])
+    def upload_phone_frame(self) -> Any:
+        """Receives a freshly focused JPEG frame pushed by the Android phone after a capture trigger."""
+        if not (self._is_logged_in() or self._is_direct_local_lan()):
+            return flask.Response("OctoPrint login required", status=403)
+        raw_bytes = flask.request.get_data()
+        if not raw_bytes:
+            return flask.jsonify({"ok": False, "error": "Empty frame payload"}), 400
+        now = time.time()
+        self._latest_phone_pushed_jpeg = raw_bytes
+        self._latest_phone_pushed_ts = now
+        self._live_frame_cache["phone"] = (now, raw_bytes)
+        self._phone_capture_requested = False
+        self._phone_capture_event.set()
+        return flask.jsonify({"ok": True, "bytes": len(raw_bytes)})
 
 
 __plugin_name__ = "PrintGuard"

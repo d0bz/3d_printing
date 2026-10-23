@@ -380,8 +380,8 @@ public class MainActivity extends Activity implements ServiceConnection {
             int w = cameraService.getPreviewWidth();
             int h = cameraService.getPreviewHeight();
             statusText.setText(
-                    "● LIVE (" + w + "×" + h + ") | Frames: " + cameraService.getFrameCount()
-                    + " | Clients: " + cameraService.getActiveClientCount()
+                    "● LIVE (" + w + "×" + h + ") | Shots: " + cameraService.getTriggeredCapturesCount()
+                    + " | Frames: " + cameraService.getFrameCount()
             );
             statusText.setTextColor(Color.rgb(88, 214, 141));
             btnToggleServer.setText("Stop Server");
@@ -401,6 +401,9 @@ public class MainActivity extends Activity implements ServiceConnection {
 
     private void pairWithOctoPrint() {
         final String baseUrl = octoprintUrlInput.getText().toString().trim().replaceAll("/+$", "");
+        if (cameraService != null) {
+            cameraService.setOctoprintBaseUrl(baseUrl);
+        }
         final String phoneIp = CameraServerService.getLocalIpAddress(this);
         final int port = CameraServerService.DEFAULT_PORT;
         pairResultText.setText("Connecting to " + baseUrl + "...");
