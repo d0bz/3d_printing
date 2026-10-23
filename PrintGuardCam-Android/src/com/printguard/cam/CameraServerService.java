@@ -58,8 +58,10 @@ public class CameraServerService extends Service implements Camera.PreviewCallba
     private Camera camera;
     private SurfaceTexture offscreenTexture;
     private int currentCameraId = 0;
-    private int previewWidth = 640;
-    private int previewHeight = 480;
+    private int targetWidth = 1920;
+    private int targetHeight = 1080;
+    private int previewWidth = 1920;
+    private int previewHeight = 1080;
     private int rotationDegrees = 90;
     private boolean torchEnabled = false;
     private long lastEncodeTimeMs = 0;
@@ -136,6 +138,14 @@ public class CameraServerService extends Service implements Camera.PreviewCallba
 
     public int getCurrentCameraId() {
         return currentCameraId;
+    }
+
+    public int getPreviewWidth() {
+        return previewWidth;
+    }
+
+    public int getPreviewHeight() {
+        return previewHeight;
     }
 
     public void startStreaming() {
@@ -227,13 +237,13 @@ public class CameraServerService extends Service implements Camera.PreviewCallba
             camera = Camera.open(currentCameraId);
             Camera.Parameters params = camera.getParameters();
 
-            // Select 640x480 or closest supported size
+            // Select targetWidth x targetHeight (default 1920x1080 Full HD) or closest supported size
             List<Camera.Size> sizes = params.getSupportedPreviewSizes();
             if (sizes != null && !sizes.isEmpty()) {
                 Camera.Size chosen = sizes.get(0);
                 int bestDiff = Integer.MAX_VALUE;
                 for (Camera.Size s : sizes) {
-                    int diff = Math.abs(s.width - 640) + Math.abs(s.height - 480);
+                    int diff = Math.abs(s.width - targetWidth) + Math.abs(s.height - targetHeight);
                     if (diff < bestDiff) {
                         bestDiff = diff;
                         chosen = s;
@@ -355,6 +365,21 @@ public class CameraServerService extends Service implements Camera.PreviewCallba
         return rotationDegrees;
     }
 
+    public synchronized String cycleResolution() {
+        if (targetWidth >= 1920) {
+            targetWidth = 1280;
+            targetHeight = 720;
+        } else if (targetWidth >= 1280) {
+            targetWidth = 640;
+            targetHeight = 480;
+        } else {
+            targetWidth = 1920;
+            targetHeight = 1080;
+        }
+        startCameraCapture();
+        return previewWidth + "x" + previewHeight;
+    }
+
     @Override
     public void onPreviewFrame(byte[] data, Camera cam) {
         if (data == null || cam == null) {
@@ -362,12 +387,13 @@ public class CameraServerService extends Service implements Camera.PreviewCallba
         }
         try {
             long now = System.currentTimeMillis();
-            // Throttle JPEG encoding to ~14 FPS to keep CPU cool during multi-hour prints
-            if (now - lastEncodeTimeMs >= 70) {
+            // Throttle JPEG encoding to ~10-12 FPS for crisp 1080p without overheating
+            if (now - lastEncodeTimeMs >= 85) {
                 lastEncodeTimeMs = now;
                 YuvImage yuv = new YuvImage(data, ImageFormat.NV21, previewWidth, previewHeight, null);
                 ByteArrayOutputStream rawOut = new ByteArrayOutputStream();
-                yuv.compressToJpeg(new Rect(0, 0, previewWidth, previewHeight), 82, rawOut);
+                int firstPassQuality = (rotationDegrees != 0) ? 96 : 92;
+                yuv.compressToJpeg(new Rect(0, 0, previewWidth, previewHeight), firstPassQuality, rawOut);
                 byte[] jpegBytes = rawOut.toByteArray();
 
                 if (rotationDegrees != 0) {
@@ -379,7 +405,7 @@ public class CameraServerService extends Service implements Camera.PreviewCallba
                                 bmp, 0, 0, bmp.getWidth(), bmp.getHeight(), matrix, true
                         );
                         ByteArrayOutputStream rotOut = new ByteArrayOutputStream();
-                        rotated.compress(Bitmap.CompressFormat.JPEG, 82, rotOut);
+                        rotated.compress(Bitmap.CompressFormat.JPEG, 92, rotOut);
                         jpegBytes = rotOut.toByteArray();
                         bmp.recycle();
                         rotated.recycle();
@@ -521,10 +547,17 @@ public class CameraServerService extends Service implements Camera.PreviewCallba
                 String json = "{\"ok\":true,\"rotation\":" + rot + "}";
                 writeJsonResponse(out, json);
 
+            } else if (fullPath.startsWith("/resolution")) {
+                String res = cycleResolution();
+                String json = "{\"ok\":true,\"resolution\":\"" + res + "\",\"width\":" + previewWidth + ",\"height\":" + previewHeight + "}";
+                writeJsonResponse(out, json);
+
             } else if (fullPath.startsWith("/status")) {
                 String json = "{\"ok\":true,\"torch\":" + torchEnabled
                         + ",\"camera_id\":" + currentCameraId
                         + ",\"rotation\":" + rotationDegrees
+                        + ",\"width\":" + previewWidth
+                        + ",\"height\":" + previewHeight
                         + ",\"frames\":" + frameCounter.get()
                         + ",\"clients\":" + activeClients.get() + "}";
                 writeJsonResponse(out, json);

@@ -794,5 +794,5 @@ def annotate_snapshot(image_bytes: bytes, result: DetectionResult) -> bytes:
         draw.text((8, 6), header_text, fill=(255, 255, 255), font=font)
 
         out = io.BytesIO()
-        canvas.save(out, format="JPEG", quality=88)
+        canvas.save(out, format="JPEG", quality=92)
         return out.getvalue()

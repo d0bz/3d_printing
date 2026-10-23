@@ -392,26 +392,26 @@ class PrintGuardPlugin(
 
     @staticmethod
     def _stitch_snapshots(*jpegs: bytes) -> bytes:
-        """Stitch two or more camera snapshots side-by-side into a single composite JPEG."""
-        resample_bilinear = getattr(Image, "Resampling", Image).BILINEAR
-        panel_w, panel_h = 320, 240
+        """Stitch two or more camera snapshots side-by-side into a single high-resolution composite JPEG."""
+        resample_bicubic = getattr(Image, "Resampling", Image).BICUBIC
+        panel_w, panel_h = 960, 720
         count = len(jpegs)
         combined = Image.new("RGB", (panel_w * count, panel_h))
         draw = ImageDraw.Draw(combined)
 
         for idx, data in enumerate(jpegs):
             with Image.open(io.BytesIO(data)) as im:
-                rgb = im.convert("RGB").resize((panel_w, panel_h), resample_bilinear)
+                rgb = im.convert("RGB").resize((panel_w, panel_h), resample_bicubic)
                 combined.paste(rgb, (idx * panel_w, 0))
             if idx > 0:
                 draw.line(
                     [(idx * panel_w, 0), (idx * panel_w, panel_h)],
                     fill=(90, 140, 220),
-                    width=2,
+                    width=3,
                 )
 
         out = io.BytesIO()
-        combined.save(out, format="JPEG", quality=88)
+        combined.save(out, format="JPEG", quality=92)
         return out.getvalue()
 
     def _build_printer_context(self) -> PrinterContext:

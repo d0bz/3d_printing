@@ -49,6 +49,7 @@ public class MainActivity extends Activity implements ServiceConnection {
     private Button btnTorch;
     private Button btnSwitchCam;
     private Button btnRotate;
+    private Button btnResolution;
     private Button btnToggleServer;
     private EditText octoprintUrlInput;
     private Button btnPairOctoprint;
@@ -252,11 +253,19 @@ public class MainActivity extends Activity implements ServiceConnection {
         row1.addView(btnRotate, btnWeight);
         main.addView(row1);
 
-        // Controls row 2: Dim Screen & Start/Stop Server
+        // Controls row 2: Quality, Dim Screen & Start/Stop Server
         LinearLayout row2 = new LinearLayout(this);
         row2.setOrientation(LinearLayout.HORIZONTAL);
 
-        Button btnDim = createButton("Dim Screen (Save Battery)", Color.rgb(38, 70, 83));
+        btnResolution = createButton("Quality: 1080p", Color.rgb(45, 55, 72));
+        btnResolution.setOnClickListener(v -> {
+            if (cameraService != null) {
+                cameraService.cycleResolution();
+                updateUiState();
+            }
+        });
+
+        Button btnDim = createButton("Dim Screen", Color.rgb(38, 70, 83));
         btnDim.setOnClickListener(v -> setDimmedMode(true));
 
         btnToggleServer = createButton("Stop Server", Color.rgb(180, 50, 50));
@@ -272,6 +281,7 @@ public class MainActivity extends Activity implements ServiceConnection {
             }
         });
 
+        row2.addView(btnResolution, btnWeight);
         row2.addView(btnDim, btnWeight);
         row2.addView(btnToggleServer, btnWeight);
         main.addView(row2);
@@ -367,10 +377,11 @@ public class MainActivity extends Activity implements ServiceConnection {
         );
 
         if (cameraService != null && cameraService.isStreaming()) {
+            int w = cameraService.getPreviewWidth();
+            int h = cameraService.getPreviewHeight();
             statusText.setText(
-                    "● LIVE | Frames: " + cameraService.getFrameCount()
+                    "● LIVE (" + w + "×" + h + ") | Frames: " + cameraService.getFrameCount()
                     + " | Clients: " + cameraService.getActiveClientCount()
-                    + " | Cam #" + cameraService.getCurrentCameraId()
             );
             statusText.setTextColor(Color.rgb(88, 214, 141));
             btnToggleServer.setText("Stop Server");
@@ -379,6 +390,7 @@ public class MainActivity extends Activity implements ServiceConnection {
             btnTorch.setText(torch ? "Flashlight: ON" : "Flashlight: OFF");
             btnTorch.setBackgroundColor(torch ? Color.rgb(214, 158, 46) : Color.rgb(45, 55, 72));
             btnRotate.setText("Rotate (" + cameraService.getRotationDegrees() + "°)");
+            btnResolution.setText("Quality: " + h + "p");
         } else {
             statusText.setText("○ STOPPED");
             statusText.setTextColor(Color.rgb(235, 110, 110));
