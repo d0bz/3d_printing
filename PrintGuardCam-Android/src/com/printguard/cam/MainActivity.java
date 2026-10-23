@@ -38,6 +38,7 @@ import java.nio.charset.StandardCharsets;
 
 public class MainActivity extends Activity implements ServiceConnection {
     private static final int REQ_CAMERA_PERMISSION = 2001;
+    private static final long IDLE_DIM_TIMEOUT_MS = 60_000L;
 
     private CameraServerService cameraService;
     private boolean serviceBound = false;
@@ -57,6 +58,7 @@ public class MainActivity extends Activity implements ServiceConnection {
     private final Handler uiHandler = new Handler(Looper.getMainLooper());
     private boolean isDimmed = false;
     private final Runnable previewUpdater = this::runPreviewTick;
+    private final Runnable idleDimRunnable = () -> setDimmedMode(true);
 
     @Override
     public void onServiceConnected(ComponentName name, IBinder binder) {
@@ -105,22 +107,40 @@ public class MainActivity extends Activity implements ServiceConnection {
     protected void onResume() {
         super.onResume();
         uiHandler.post(previewUpdater);
+        resetIdleDimTimer();
     }
 
     @Override
     protected void onPause() {
         super.onPause();
         uiHandler.removeCallbacks(previewUpdater);
+        uiHandler.removeCallbacks(idleDimRunnable);
     }
 
     @Override
     protected void onDestroy() {
         uiHandler.removeCallbacks(previewUpdater);
+        uiHandler.removeCallbacks(idleDimRunnable);
         if (serviceBound) {
             unbindService(this);
             serviceBound = false;
         }
         super.onDestroy();
+    }
+
+    @Override
+    public void onUserInteraction() {
+        super.onUserInteraction();
+        if (!isDimmed) {
+            resetIdleDimTimer();
+        }
+    }
+
+    private void resetIdleDimTimer() {
+        uiHandler.removeCallbacks(idleDimRunnable);
+        if (!isDimmed) {
+            uiHandler.postDelayed(idleDimRunnable, IDLE_DIM_TIMEOUT_MS);
+        }
     }
 
     private boolean hasCameraPermission() {
@@ -330,6 +350,11 @@ public class MainActivity extends Activity implements ServiceConnection {
         WindowManager.LayoutParams lp = getWindow().getAttributes();
         lp.screenBrightness = dim ? 0.01f : WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE;
         getWindow().setAttributes(lp);
+        if (dim) {
+            uiHandler.removeCallbacks(idleDimRunnable);
+        } else {
+            resetIdleDimTimer();
+        }
     }
 
     private void updateUiState() {
