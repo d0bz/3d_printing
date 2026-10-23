@@ -898,10 +898,13 @@ class PrintGuardPlugin(
             flask.request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
         )
         client_ip = xff or (flask.request.remote_addr or "")
+        if client_ip.startswith("::ffff:"):
+            client_ip = client_ip[7:]
         return (
             client_ip.startswith("192.168.")
             or client_ip.startswith("10.")
-            or client_ip == "127.0.0.1"
+            or client_ip.startswith("172.")
+            or client_ip in ("127.0.0.1", "::1")
         )
 
     @_blueprint_route("/snapshot.jpg", methods=["GET"])
@@ -974,11 +977,16 @@ class PrintGuardPlugin(
             return flask.Response("OctoPrint login required", status=403)
         data = flask.request.get_json(silent=True) or {}
         phone_ip = str(data.get("ip") or flask.request.remote_addr or "").strip()
+        if phone_ip.startswith("::ffff:"):
+            phone_ip = phone_ip[7:]
         phone_port = int(data.get("port") or 8080)
         phone_name = str(
             data.get("name") or f"Android Phone IP Cam ({phone_ip})"
         ).strip()
         snap_url = f"http://{phone_ip}:{phone_port}/?action=snapshot"
+
+        current_cam = str(self._get_setting("active_camera", "cam1_phone") or "cam1_phone")
+        new_cam = current_cam if current_cam in ("cam1_phone", "both", "phone") else "cam1_phone"
 
         if self._settings is not None:
             try:
@@ -986,7 +994,7 @@ class PrintGuardPlugin(
                 self._settings.set(["phone_camera_port"], phone_port)
                 self._settings.set(["phone_snapshot_url"], snap_url)
                 self._settings.set(["phone_camera_name"], phone_name)
-                self._settings.set(["active_camera"], "phone")
+                self._settings.set(["active_camera"], new_cam)
                 self._settings.save()
             except Exception as exc:
                 self._logger.warning("Failed to save paired phone settings: %s", exc)
@@ -1001,7 +1009,7 @@ class PrintGuardPlugin(
         return flask.jsonify(
             {
                 "ok": True,
-                "active_camera": "phone",
+                "active_camera": new_cam,
                 "snapshot_url": snap_url,
                 "stream_url": f"http://{phone_ip}:{phone_port}/?action=stream",
             }

@@ -54,6 +54,7 @@ public class CameraServerService extends Service implements Camera.PreviewCallba
 
     private final IBinder binder = new LocalBinder(this);
     private PowerManager.WakeLock wakeLock;
+    private WifiManager.WifiLock wifiLock;
     private Camera camera;
     private SurfaceTexture offscreenTexture;
     private int currentCameraId = 0;
@@ -149,6 +150,12 @@ public class CameraServerService extends Service implements Camera.PreviewCallba
         isRunning.set(false);
         stopHttpServer();
         stopCameraCapture();
+        if (wifiLock != null && wifiLock.isHeld()) {
+            try {
+                wifiLock.release();
+            } catch (Exception ignored) {
+            }
+        }
         if (wakeLock != null && wakeLock.isHeld()) {
             try {
                 wakeLock.release();
@@ -163,6 +170,12 @@ public class CameraServerService extends Service implements Camera.PreviewCallba
         if (pm != null && (wakeLock == null || !wakeLock.isHeld())) {
             wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PrintGuardCam::StreamingWakeLock");
             wakeLock.acquire();
+        }
+        WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+        if (wm != null && (wifiLock == null || !wifiLock.isHeld())) {
+            wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "PrintGuardCam::StreamingWifiLock");
+            wifiLock.setReferenceCounted(false);
+            wifiLock.acquire();
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
