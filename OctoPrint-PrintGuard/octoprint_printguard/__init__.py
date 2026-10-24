@@ -205,7 +205,7 @@ class PrintGuardPlugin(
             # Vision AI provider configuration
             "vision_provider": "gemini",  # "gemini", "openai", "ollama"
             "vision_api_key": "",
-            "vision_model": "gemini-2.5-flash",
+            "vision_model": "gemini-3.1-flash-lite",
             "vision_api_base_url": "",
             # External Notifications & Webhooks
             "notify_on_warning": False,
@@ -272,15 +272,7 @@ class PrintGuardPlugin(
         sensitivity = float(self._get_setting("sensitivity", 1.0))
         onnx_path = str(self._get_setting("onnx_model_path", ""))
 
-        raw_model = str(self._get_setting("vision_model", "gemini-2.5-flash")).strip()
-        if raw_model.startswith("gemini-3"):
-            raw_model = "gemini-2.5-flash"
-            if self._settings is not None:
-                try:
-                    self._settings.set(["vision_model"], raw_model)
-                    self._settings.save()
-                except Exception:
-                    pass
+        raw_model = str(self._get_setting("vision_model", "gemini-3.1-flash-lite")).strip()
 
         local_detector = LocalCVDetector(
             warning_threshold=warning_th,
@@ -393,6 +385,19 @@ class PrintGuardPlugin(
                 self._live_frame_cache["phone"] = (time.time(), r.content)
                 return r.content
             except Exception as direct_exc:
+                # Fallback to standard snapshot endpoint if /capture timed out
+                if phone_ip:
+                    try:
+                        snap_url = self._resolve_snapshot_url("phone")
+                        r_snap = requests.get(snap_url, timeout=4.0)
+                        r_snap.raise_for_status()
+                        self._phone_capture_requested = False
+                        self._latest_phone_pushed_jpeg = r_snap.content
+                        self._latest_phone_pushed_ts = time.time()
+                        self._live_frame_cache["phone"] = (time.time(), r_snap.content)
+                        return r_snap.content
+                    except Exception:
+                        pass
                 # Wait for phone's outbound poll (/phone_poll -> autoFocus -> /upload_phone_frame)
                 if self._phone_capture_event.wait(timeout=6.0) and self._latest_phone_pushed_jpeg:
                     return self._latest_phone_pushed_jpeg

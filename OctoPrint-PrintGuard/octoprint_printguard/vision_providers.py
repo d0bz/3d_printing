@@ -246,22 +246,19 @@ class VisionAIClient:
     ):
         self.provider = (provider or "gemini").lower().strip()
         self.api_key = api_key or ""
-        raw_model = (model or "").strip()
-        if self.provider == "gemini" and raw_model.startswith("gemini-3"):
-            raw_model = "gemini-2.5-flash"
-        self.model = raw_model or self._default_model(self.provider)
+        self.model = (model or "").strip() or self._default_model(self.provider)
         self.api_base_url = (api_base_url or "").rstrip("/")
         self.timeout = timeout
 
     @staticmethod
     def _default_model(provider: str) -> str:
         if provider == "gemini":
-            return "gemini-2.5-flash"
+            return "gemini-3.1-flash-lite"
         if provider == "openai":
             return "gpt-4o-mini"
         if provider == "ollama":
             return "llava"
-        return "gemini-2.5-flash"
+        return "gemini-3.1-flash-lite"
 
     @staticmethod
     def _compress_for_api(jpeg_bytes: bytes, max_width: int = 800) -> bytes:
@@ -333,9 +330,6 @@ class VisionAIClient:
         model_id = self.model.strip()
         if model_id.startswith("models/"):
             model_id = model_id[len("models/") :]
-        if model_id.startswith("gemini-3"):
-            model_id = "gemini-2.5-flash"
-            self.model = model_id
         url = f"{base_url}/models/{model_id}:generateContent"
         headers = {
             "Content-Type": "application/json",
@@ -370,17 +364,23 @@ class VisionAIClient:
         }
         req_timeout = max(25, int(self.timeout))
         resp = requests.post(url, headers=headers, json=payload, timeout=req_timeout)
-        if resp.status_code == 404 and model_id != "gemini-2.5-flash":
-            logger.warning(
-                "Gemini model '%s' returned 404; caching and retrying with 'gemini-2.5-flash'",
-                model_id,
-            )
-            self.model = "gemini-2.5-flash"
-            model_id = "gemini-2.5-flash"
-            fallback_url = f"{base_url}/models/gemini-2.5-flash:generateContent"
-            resp = requests.post(
-                fallback_url, headers=headers, json=payload, timeout=req_timeout
-            )
+        if resp.status_code == 404:
+            for candidate in ("gemini-3.1-flash-lite", "gemini-3.8-flash", "gemini-2.5-flash"):
+                if candidate == model_id:
+                    continue
+                logger.warning(
+                    "Gemini model '%s' returned 404; retrying with '%s'",
+                    model_id,
+                    candidate,
+                )
+                fallback_url = f"{base_url}/models/{candidate}:generateContent"
+                resp = requests.post(
+                    fallback_url, headers=headers, json=payload, timeout=req_timeout
+                )
+                if resp.status_code != 404:
+                    self.model = candidate
+                    model_id = candidate
+                    break
         if not resp.ok:
             raise RuntimeError(
                 f"Gemini API HTTP {resp.status_code} ({model_id}): {resp.text[:250]}"
