@@ -272,6 +272,16 @@ class PrintGuardPlugin(
         sensitivity = float(self._get_setting("sensitivity", 1.0))
         onnx_path = str(self._get_setting("onnx_model_path", ""))
 
+        raw_model = str(self._get_setting("vision_model", "gemini-2.5-flash")).strip()
+        if raw_model.startswith("gemini-3"):
+            raw_model = "gemini-2.5-flash"
+            if self._settings is not None:
+                try:
+                    self._settings.set(["vision_model"], raw_model)
+                    self._settings.save()
+                except Exception:
+                    pass
+
         local_detector = LocalCVDetector(
             warning_threshold=warning_th,
             failure_threshold=failure_th,
@@ -281,7 +291,7 @@ class PrintGuardPlugin(
         vision_client = VisionAIClient(
             provider=str(self._get_setting("vision_provider", "gemini")),
             api_key=str(self._get_setting("vision_api_key", "")),
-            model=str(self._get_setting("vision_model", "gemini-2.5-flash")),
+            model=raw_model,
             api_base_url=str(self._get_setting("vision_api_base_url", "")),
         )
         self._detector = HybridDetector(
@@ -470,15 +480,25 @@ class PrintGuardPlugin(
             try:
                 is_printing = bool(self._printer.is_printing())
                 current_data = self._printer.get_current_data() or {}
-                if self._current_z is None and current_data.get("currentZ") is not None:
+                if current_data.get("currentZ") is not None:
                     try:
-                        self._current_z = float(current_data["currentZ"])
+                        cz = float(current_data["currentZ"])
+                        if cz > 0.0:
+                            self._current_z = cz
                     except (TypeError, ValueError):
                         pass
                 prog = current_data.get("progress") or {}
                 progress = float(prog.get("completion") or 0.0)
                 job = current_data.get("job") or {}
                 file_info = job.get("file") or {}
+                if progress <= 0.0 and prog.get("filepos") and file_info.get("size"):
+                    try:
+                        progress = min(
+                            100.0,
+                            (float(prog["filepos"]) / float(file_info["size"])) * 100.0,
+                        )
+                    except (TypeError, ValueError, ZeroDivisionError):
+                        pass
                 filename = file_info.get("name")
                 filepath = file_info.get("path") or filename
 
@@ -500,17 +520,22 @@ class PrintGuardPlugin(
 
         expected_summary: Optional[str] = None
         expected_jpeg: Optional[bytes] = None
+        effective_z = self._current_z
         try:
             expected_state = self._gcode_analyzer.get_expected_state(
                 filepath or filename,
                 current_z=self._current_z,
                 progress_completion=progress,
+                is_printing=is_printing,
             )
             if expected_state is not None:
                 expected_summary = expected_state.summary_text
                 expected_jpeg = expected_state.reference_jpeg
                 self._latest_expected_model_summary = expected_summary
                 self._latest_expected_model_jpeg = expected_jpeg
+                if is_printing and (effective_z is None or effective_z <= 0.0):
+                    effective_z = expected_state.current_z
+                    self._current_z = effective_z
                 if not filename:
                     filename = expected_state.filename
         except Exception as exc:
@@ -518,7 +543,7 @@ class PrintGuardPlugin(
 
         return PrinterContext(
             is_printing=is_printing,
-            current_z=self._current_z,
+            current_z=effective_z,
             previous_z=self._previous_z,
             z_change_count=self._z_change_count,
             print_time_elapsed=elapsed,

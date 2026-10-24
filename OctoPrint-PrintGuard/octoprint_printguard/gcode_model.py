@@ -113,6 +113,7 @@ class GCodeModelAnalyzer:
         filename_or_path: Optional[str],
         current_z: Optional[float] = None,
         progress_completion: Optional[float] = None,
+        is_printing: bool = False,
     ) -> Optional[ExpectedModelAtZ]:
         """Return the expected model state and rendered 3D/2D reference JPEG for the given file & Z."""
         filepath = self._resolve_filepath(filename_or_path)
@@ -123,11 +124,23 @@ class GCodeModelAnalyzer:
         if model is None or not model.layers:
             return None
 
+        prog_z = (
+            round((float(progress_completion) / 100.0) * model.z_max, 2)
+            if (progress_completion is not None and progress_completion > 0.0)
+            else None
+        )
+
         # Determine effective Z height from current_z or print completion %
-        eff_z = current_z
-        if eff_z is None or eff_z <= 0.0:
-            if progress_completion is not None and progress_completion > 0.0:
-                eff_z = round((progress_completion / 100.0) * model.z_max, 2)
+        if current_z is not None and current_z > 0.0:
+            eff_z = float(current_z)
+            # If current_z got stuck on the first layer while print completion advanced
+            if is_printing and prog_z is not None and eff_z <= 0.4 and prog_z > eff_z + 0.8:
+                eff_z = prog_z
+        else:
+            if prog_z is not None:
+                eff_z = max(model.z_min, prog_z)
+            elif is_printing:
+                eff_z = model.z_min
             else:
                 eff_z = model.z_max  # If inspecting while idle, show full model
 
@@ -189,6 +202,22 @@ class GCodeModelAnalyzer:
             candidate = os.path.join(self.uploads_dir, filename_or_path)
             if os.path.isfile(candidate):
                 return candidate
+            if os.path.isdir(self.uploads_dir):
+                target_lower = os.path.splitext(os.path.basename(filename_or_path))[0].lower()
+                target_prefix = target_lower.split("~")[0]
+                try:
+                    for f in os.listdir(self.uploads_dir):
+                        if not f.lower().endswith((".gcode", ".gco", ".g")):
+                            continue
+                        stem_lower = os.path.splitext(f)[0].lower()
+                        if (
+                            stem_lower == target_lower
+                            or (len(target_prefix) >= 4 and stem_lower.startswith(target_prefix))
+                            or (len(target_lower) >= 4 and target_lower in stem_lower)
+                        ):
+                            return os.path.join(self.uploads_dir, f)
+                except Exception:
+                    pass
         # Fallback: most recently modified .gcode in uploads_dir
         if os.path.isdir(self.uploads_dir):
             try:
@@ -494,28 +523,46 @@ class GCodeModelAnalyzer:
 
         top_active_z = active_layers[-1].z_height
 
+        # 1a. Draw ghosted future layers (> current_z) FIRST in the background
         for ly in sampled_layers:
-            is_done = ly.z_height <= current_z + 0.05
-            is_top_active = abs(ly.z_height - top_active_z) < 0.01
-            if is_top_active:
-                color = (255, 215, 60)  # Bright gold for current active nozzle layer
-            elif is_done:
-                # Gradient from teal at base to bright green near current_z
-                z_ratio = min(1.0, ly.z_height / max(0.1, model.z_max))
-                color = (
-                    int(40 + 40 * z_ratio),
-                    int(165 + 75 * z_ratio),
-                    int(130 + 70 * (1.0 - z_ratio)),
-                )
-            else:
-                # Ghosted future layers above current_z
-                color = (45, 58, 78)
-
-            seg_step = 1 if is_top_active else (2 if is_done else 4)
-            for x0, y0, x1, y1, _ in ly.segments[::seg_step]:
+            if ly.z_height <= current_z + 0.05:
+                continue
+            for x0, y0, x1, y1, _ in ly.segments[::4]:
                 p0 = to_iso(x0, y0, ly.z_height)
                 p1 = to_iso(x1, y1, ly.z_height)
-                draw.line([p0, p1], fill=color, width=2 if is_top_active else 1)
+                draw.line([p0, p1], fill=(38, 48, 65), width=1)
+
+        # 1b. Draw completed layers (<= current_z) ON TOP in bright emerald green
+        for ly in sampled_layers:
+            if ly.z_height > current_z + 0.05:
+                continue
+            is_top_active = abs(ly.z_height - top_active_z) < 0.01
+            if is_top_active:
+                continue
+            z_ratio = min(1.0, ly.z_height / max(0.1, model.z_max))
+            color = (
+                int(35 + 45 * z_ratio),
+                int(175 + 75 * z_ratio),
+                int(120 + 60 * (1.0 - z_ratio)),
+            )
+            for x0, y0, x1, y1, _ in ly.segments[::2]:
+                p0 = to_iso(x0, y0, ly.z_height)
+                p1 = to_iso(x1, y1, ly.z_height)
+                draw.line([p0, p1], fill=color, width=1)
+
+        # 1c. Draw active nozzle layer ON TOP OF ALL in bright gold + Z-slice plane outline
+        top_ly = active_layers[-1]
+        z_plane_poly = [
+            to_iso(bx0, by0, top_active_z),
+            to_iso(bx1, by0, top_active_z),
+            to_iso(bx1, by1, top_active_z),
+            to_iso(bx0, by1, top_active_z),
+        ]
+        draw.polygon(z_plane_poly, outline=(180, 150, 45))
+        for x0, y0, x1, y1, _ in top_ly.segments:
+            p0 = to_iso(x0, y0, top_active_z)
+            p1 = to_iso(x1, y1, top_active_z)
+            draw.line([p0, p1], fill=(255, 220, 45), width=2)
 
         draw.text((16, 40), "3D Expected Model @ Current Z", fill=(160, 210, 255), font=font)
         draw.text(

@@ -329,14 +329,17 @@ class LocalCVDetector:
                 c_gy = roi_gy[cy0:cy1, cx0:cx1][c_edge]
                 non_layer_ratio = float(np.mean(c_gx > 0.78 * c_gy))
 
-                if entropy >= 2.42 and non_layer_ratio >= 0.38 and c_density >= 0.15:
+                if entropy >= 2.55 and non_layer_ratio >= 0.45 and c_density >= 0.18:
                     cell_score = min(
                         1.0,
                         (c_density / 0.32) * (entropy / 2.8) * (non_layer_ratio / 0.55),
                     )
                     chaotic_cells.append((r, c, cell_score))
 
-        if len(chaotic_cells) < 2:
+        # Require at least 3 chaotic cells AND at least 2 in the lower print-bed zone (r >= 3)
+        # so the upper toolhead cooling fan / extruder / wiring harness (r <= 2) never false-triggers
+        bed_zone_cells = [cell for cell in chaotic_cells if cell[0] >= 3]
+        if len(chaotic_cells) < 3 or len(bed_zone_cells) < 2:
             return 0.0, None
 
         # Aggregate score from chaotic cells

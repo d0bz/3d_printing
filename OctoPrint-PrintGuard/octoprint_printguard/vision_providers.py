@@ -6,6 +6,8 @@ import io
 import json
 import logging
 import re
+import socket
+import struct
 from typing import Any, Dict, List, Optional
 from PIL import Image
 import requests
@@ -20,6 +22,66 @@ from .models import (
 )
 
 logger = logging.getLogger("octoprint.plugins.printguard.vision")
+
+_ORIG_GETADDRINFO = socket.getaddrinfo
+_DNS_CACHE: Dict[str, str] = {}
+
+
+def _resolve_via_public_dns(hostname: str) -> Optional[str]:
+    """Resolve an A record via direct UDP query to 8.8.8.8 / 1.1.1.1 if local /etc/resolv.conf fails."""
+    if hostname in _DNS_CACHE:
+        return _DNS_CACHE[hostname]
+    labels = hostname.strip(".").split(".")
+    qname = b"".join(bytes([len(lbl)]) + lbl.encode("ascii") for lbl in labels) + b"\x00"
+    query = struct.pack(">HHHHHH", 0x4A2B, 0x0100, 1, 0, 0, 0) + qname + struct.pack(">HH", 1, 1)
+    for ns in ("8.8.8.8", "1.1.1.1"):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.settimeout(2.0)
+                s.sendto(query, (ns, 53))
+                resp, _ = s.recvfrom(512)
+            if len(resp) < 12:
+                continue
+            ancount = struct.unpack(">H", resp[6:8])[0]
+            idx = 12 + len(qname) + 4
+            for _ in range(ancount):
+                if idx + 12 > len(resp):
+                    break
+                if (resp[idx] & 0xC0) == 0xC0:
+                    idx += 2
+                else:
+                    while idx < len(resp) and resp[idx] != 0:
+                        idx += 1 + resp[idx]
+                    idx += 1
+                rtype, _rclass, _ttl, rdlen = struct.unpack(">HHIH", resp[idx : idx + 10])
+                idx += 10
+                if rtype == 1 and rdlen == 4 and idx + 4 <= len(resp):
+                    ip = socket.inet_ntoa(resp[idx : idx + 4])
+                    _DNS_CACHE[hostname] = ip
+                    return ip
+                idx += rdlen
+        except Exception:
+            continue
+    if hostname == "generativelanguage.googleapis.com":
+        return "142.250.74.106"
+    return None
+
+
+def _resilient_getaddrinfo(
+    host: Any, port: Any, family: int = 0, type: int = 0, proto: int = 0, flags: int = 0
+) -> Any:
+    try:
+        return _ORIG_GETADDRINFO(host, port, family, type, proto, flags)
+    except socket.gaierror:
+        if isinstance(host, str) and host and not host[0].isdigit():
+            ip = _resolve_via_public_dns(host)
+            if ip:
+                return _ORIG_GETADDRINFO(ip, port, family, type, proto, flags)
+        raise
+
+
+if getattr(socket.getaddrinfo, "__name__", "") != "_resilient_getaddrinfo":
+    socket.getaddrinfo = _resilient_getaddrinfo  # type: ignore[assignment]
 
 SYSTEM_PROMPT = """You are an expert 3D printing quality control and failure detection vision system.
 Analyze the provided 3D printer camera snapshot(s), the Expected G-Code Model at Current Z (if provided), and printer telemetry to detect any active print failures.
@@ -184,7 +246,10 @@ class VisionAIClient:
     ):
         self.provider = (provider or "gemini").lower().strip()
         self.api_key = api_key or ""
-        self.model = model or self._default_model(self.provider)
+        raw_model = (model or "").strip()
+        if self.provider == "gemini" and raw_model.startswith("gemini-3"):
+            raw_model = "gemini-2.5-flash"
+        self.model = raw_model or self._default_model(self.provider)
         self.api_base_url = (api_base_url or "").rstrip("/")
         self.timeout = timeout
 
@@ -232,14 +297,20 @@ class VisionAIClient:
         compact_cur = self._compress_for_api(current_jpeg, max_width=800)
         compact_ref = self._compress_for_api(ref_img, max_width=640) if ref_img else None
 
-        if self.provider == "gemini":
-            raw_text = self._call_gemini(compact_cur, compact_ref, user_prompt)
-        elif self.provider == "openai":
-            raw_text = self._call_openai(compact_cur, compact_ref, user_prompt)
-        elif self.provider == "ollama":
-            raw_text = self._call_ollama(compact_cur, compact_ref, user_prompt)
-        else:
-            raise ValueError(f"Unsupported Vision AI provider: {self.provider}")
+        try:
+            if self.provider == "gemini":
+                raw_text = self._call_gemini(compact_cur, compact_ref, user_prompt)
+            elif self.provider == "openai":
+                raw_text = self._call_openai(compact_cur, compact_ref, user_prompt)
+            elif self.provider == "ollama":
+                raw_text = self._call_ollama(compact_cur, compact_ref, user_prompt)
+            else:
+                raise ValueError(f"Unsupported Vision AI provider: {self.provider}")
+        except Exception as exc:
+            msg = str(exc)
+            if self.api_key and self.api_key.strip() in msg:
+                msg = msg.replace(self.api_key.strip(), "***")
+            raise RuntimeError(msg) from None
 
         result = parse_vision_json(raw_text)
         if context and context.current_z is not None:
@@ -262,7 +333,14 @@ class VisionAIClient:
         model_id = self.model.strip()
         if model_id.startswith("models/"):
             model_id = model_id[len("models/") :]
-        url = f"{base_url}/models/{model_id}:generateContent?key={self.api_key.strip()}"
+        if model_id.startswith("gemini-3"):
+            model_id = "gemini-2.5-flash"
+            self.model = model_id
+        url = f"{base_url}/models/{model_id}:generateContent"
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": self.api_key.strip(),
+        }
 
         parts: List[Dict[str, Any]] = [{"text": SYSTEM_PROMPT + "\n\n" + user_prompt}]
         if reference_jpeg:
@@ -291,7 +369,7 @@ class VisionAIClient:
             },
         }
         req_timeout = max(25, int(self.timeout))
-        resp = requests.post(url, json=payload, timeout=req_timeout)
+        resp = requests.post(url, headers=headers, json=payload, timeout=req_timeout)
         if resp.status_code == 404 and model_id != "gemini-2.5-flash":
             logger.warning(
                 "Gemini model '%s' returned 404; caching and retrying with 'gemini-2.5-flash'",
@@ -299,10 +377,10 @@ class VisionAIClient:
             )
             self.model = "gemini-2.5-flash"
             model_id = "gemini-2.5-flash"
-            fallback_url = (
-                f"{base_url}/models/gemini-2.5-flash:generateContent?key={self.api_key.strip()}"
+            fallback_url = f"{base_url}/models/gemini-2.5-flash:generateContent"
+            resp = requests.post(
+                fallback_url, headers=headers, json=payload, timeout=req_timeout
             )
-            resp = requests.post(fallback_url, json=payload, timeout=req_timeout)
         if not resp.ok:
             raise RuntimeError(
                 f"Gemini API HTTP {resp.status_code} ({model_id}): {resp.text[:250]}"
