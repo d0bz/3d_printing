@@ -415,8 +415,14 @@ G1 X120.0 Y120.0 E6.0
     plugin.stop_monitoring()
     plugin._print_start_time = 100.0
 
-    # Verify ZChange immediately updates expected_model_summary without waiting for camera check
+    # Verify ZChange re-renders expected_model_summary in the background without waiting for a camera check
     plugin.on_event("ZChange", {"old": 0.2, "new": 1.0})
+    import time as _time
+
+    for _ in range(50):
+        if plugin._latest_expected_model_summary and "Layer 2/3" in plugin._latest_expected_model_summary:
+            break
+        _time.sleep(0.1)
     assert plugin._latest_expected_model_summary is not None
     assert "Layer 2/3" in plugin._latest_expected_model_summary
 
@@ -434,3 +440,61 @@ G1 X120.0 Y120.0 E6.0
 
 
 
+
+
+def test_gcode_model_analyzer_tracks_multiple_objects_on_plate(tmp_path):
+    """Every @Object on the plate must be tracked, even if the first object has thousands of moves."""
+    lines = [";Generated with Cura_SteamEngine 4.9.1", ";LAYER_COUNT:3"]
+    e = 0.0
+
+    def square(x0, y0, size, steps=400):
+        nonlocal e
+        out = [f"G0 X{x0:.2f} Y{y0:.2f}", ";TYPE:WALL-OUTER"]
+        # Many tiny moves along the perimeter (like arcs) so a naive first-N cap would be exhausted
+        pts = []
+        for i in range(steps):
+            pts.append((x0 + size * i / steps, y0))
+        for i in range(steps):
+            pts.append((x0 + size, y0 + size * i / steps))
+        for i in range(steps):
+            pts.append((x0 + size - size * i / steps, y0 + size))
+        for i in range(steps):
+            pts.append((x0, y0 + size - size * i / steps))
+        pts.append((x0, y0))
+        for x, y in pts:
+            e += 0.01
+            out.append(f"G1 X{x:.3f} Y{y:.3f} E{e:.3f}")
+        return out
+
+    for layer, z in enumerate((0.2, 0.4, 0.6)):
+        lines.append(f";LAYER:{layer}")
+        lines.append(f"G0 Z{z}")
+        lines.append("@Object Big_Part.stl")
+        lines += square(30.0, 30.0, 60.0)
+        if layer < 2:  # second object is shorter
+            lines.append("@Object Small_Part.stl")
+            lines += square(150.0, 150.0, 20.0)
+    (tmp_path / "plate.gcode").write_text("\n".join(lines), encoding="utf-8")
+
+    analyzer = GCodeModelAnalyzer(uploads_dir=str(tmp_path))
+    state = analyzer.get_expected_state("plate.gcode", current_z=0.4, is_printing=True)
+    assert state is not None
+    names = [o["name"] for o in state.objects_status]
+    assert names == ["Big_Part.stl", "Small_Part.stl"]
+    by_name = {o["name"]: o for o in state.objects_status}
+    assert by_name["Small_Part.stl"]["status"] == "complete"
+    assert by_name["Big_Part.stl"]["status"] == "printing"
+    assert "2 separate objects" in state.summary_text
+    # Footprint covers BOTH objects (X 30..170), not just the first
+    assert state.footprint_x_max == pytest.approx(170.0, abs=0.5)
+
+    model = analyzer._cached_model
+    top = model.layers[-1]
+    first = model.layers[0]
+    # Second object keeps its own outline segments even though the first object had 1600 moves
+    assert len(first.obj_segments["Small_Part.stl"]) >= 20
+    assert len(first.obj_segments["Big_Part.stl"]) >= 20
+    assert "Small_Part.stl" not in top.obj_segments
+
+    with Image.open(io.BytesIO(state.reference_jpeg)) as ref_img:
+        assert ref_img.size == (640, 480)

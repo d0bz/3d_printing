@@ -583,6 +583,13 @@ class PrintGuardPlugin(
                 self._rebuild_components()
             if self._detector is not None:
                 self._detector.reset_state()
+            # Pre-parse the (possibly very large) G-code in the background so the first checks and
+            # ZChange events never block on parsing, and only one thread ever parses it.
+            threading.Thread(
+                target=self._build_printer_context,
+                name="PrintGuardGCodePreload",
+                daemon=True,
+            ).start()
             if bool(self._get_setting("enabled", True)):
                 self.start_monitoring()
 
@@ -611,23 +618,34 @@ class PrintGuardPlugin(
                 try:
                     self._current_z = float(new_z)
                     self._z_change_count += 1
-                    ctx = self._build_printer_context()
-                    if (
-                        self._latest_raw_jpeg is not None
-                        and self._last_result is not None
-                        and ctx.expected_model_jpeg is not None
-                    ):
-                        try:
-                            self._latest_annotated_jpeg = annotate_snapshot(
-                                self._latest_raw_jpeg,
-                                self._last_result,
-                                expected_model_jpeg=ctx.expected_model_jpeg,
-                            )
-                        except Exception:
-                            pass
-                    self._send_ui_update()
                 except (TypeError, ValueError):
+                    return
+                threading.Thread(
+                    target=self._refresh_expected_model_overlay,
+                    name="PrintGuardZRefresh",
+                    daemon=True,
+                ).start()
+
+    def _refresh_expected_model_overlay(self) -> None:
+        """Re-render the expected 3D model for the new Z and refresh the annotated snapshot + UI."""
+        try:
+            ctx = self._build_printer_context()
+            if (
+                self._latest_raw_jpeg is not None
+                and self._last_result is not None
+                and ctx.expected_model_jpeg is not None
+            ):
+                try:
+                    self._latest_annotated_jpeg = annotate_snapshot(
+                        self._latest_raw_jpeg,
+                        self._last_result,
+                        expected_model_jpeg=ctx.expected_model_jpeg,
+                    )
+                except Exception:
                     pass
+            self._send_ui_update()
+        except Exception as exc:
+            self._logger.debug("Expected-model refresh failed: %s", exc)
 
     def start_monitoring(self) -> None:
         with self._monitor_lock:

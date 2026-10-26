@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import re
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -25,9 +26,40 @@ class LayerSlice:
     y_min: float = 9999.0
     x_max: float = -9999.0
     y_max: float = -9999.0
-    # Sampled 2D extrusion segments: (x0, y0, x1, y1, is_outer_wall)
+    # Sampled 2D extrusion segments across ALL objects: (x0, y0, x1, y1, is_outer_wall)
     segments: List[Tuple[float, float, float, float, bool]] = field(default_factory=list)
     extrusion_length_mm: float = 0.0
+    # Per-object sampled segments + bounds so every object on the bed is represented
+    obj_segments: Dict[str, List[Tuple[float, float, float, float, bool]]] = field(
+        default_factory=dict
+    )
+    obj_bounds: Dict[str, List[float]] = field(default_factory=dict)  # [xmin, ymin, xmax, ymax]
+    # Path-simplification state per object: [anchor_x, anchor_y, last_end_x, last_end_y]
+    obj_anchor: Dict[str, List[float]] = field(default_factory=dict)
+
+
+@dataclass
+class ObjectInfo:
+    """Summary of one printed object (slicer @Object / ;MESH:) on the build plate."""
+
+    name: str
+    first_z: float = 9999.0
+    last_z: float = 0.0
+    layer_count: int = 0
+    x_min: float = 9999.0
+    y_min: float = 9999.0
+    x_max: float = -9999.0
+    y_max: float = -9999.0
+
+    @property
+    def label(self) -> str:
+        if self.name.upper() == "NONMESH":
+            return "Support/other"
+        base = self.name
+        for ext in (".stl", ".3mf", ".obj"):
+            if base.lower().endswith(ext):
+                base = base[: -len(ext)]
+        return base
 
 
 @dataclass
@@ -48,6 +80,8 @@ class ParsedGCodeModel:
     z_max: float = 0.0
     total_layers: int = 0
     layers: List[LayerSlice] = field(default_factory=list)
+    objects: Dict[str, ObjectInfo] = field(default_factory=dict)
+    object_order: List[str] = field(default_factory=list)
     embedded_thumbnail_png: Optional[bytes] = None
 
     @property
@@ -86,6 +120,8 @@ class ExpectedModelAtZ:
     active_y_max: float
     summary_text: str
     reference_jpeg: bytes
+    # Per-object state at current Z: [{"name", "label", "status", "layers_done", "layers_total", ...}]
+    objects_status: List[Dict[str, Any]] = field(default_factory=list)
 
     @property
     def width_mm(self) -> float:
@@ -107,6 +143,9 @@ class GCodeModelAnalyzer:
     def __init__(self, uploads_dir: str = "/home/pi/.octoprint/uploads"):
         self.uploads_dir = uploads_dir
         self._cached_model: Optional[ParsedGCodeModel] = None
+        self._parse_lock = threading.Lock()
+        self._render_cache_key: Optional[Tuple[Any, ...]] = None
+        self._render_cache_value: Optional[ExpectedModelAtZ] = None
 
     def get_expected_state(
         self,
@@ -154,6 +193,11 @@ class GCodeModelAnalyzer:
         completed_count = len(active_layers)
         top_layer = active_layers[-1]
 
+        # Re-use the previously rendered result while still on the same layer of the same file
+        cache_key = (model.filepath, model.mtime, completed_count, round(eff_z, 2))
+        if self._render_cache_key == cache_key and self._render_cache_value is not None:
+            return self._render_cache_value
+
         fp_xmin = min(ly.x_min for ly in active_layers if ly.x_min < 9000)
         fp_ymin = min(ly.y_min for ly in active_layers if ly.y_min < 9000)
         fp_xmax = max(ly.x_max for ly in active_layers if ly.x_max > -9000)
@@ -164,18 +208,71 @@ class GCodeModelAnalyzer:
         active_w = max(0.0, top_layer.x_max - top_layer.x_min)
         active_d = max(0.0, top_layer.y_max - top_layer.y_min)
 
-        obj_label = model.object_name or os.path.splitext(model.filename)[0]
-        summary = (
-            f"Model '{obj_label}': at Z={eff_z:.2f}mm / {model.z_max:.2f}mm "
-            f"(Layer {completed_count}/{model.total_layers}, {height_frac * 100:.0f}% height). "
-            f"Expected footprint on bed: {w_mm:.1f}mm wide (X:{fp_xmin:.0f}..{fp_xmax:.0f}) × "
-            f"{d_mm:.1f}mm deep (Y:{fp_ymin:.0f}..{fp_ymax:.0f}); "
-            f"current top layer cross-section: {active_w:.1f}mm × {active_d:.1f}mm."
-        )
+        # Per-object progress at the current Z
+        objects_status: List[Dict[str, Any]] = []
+        for name in model.object_order:
+            info = model.objects.get(name)
+            if info is None:
+                continue
+            layers_done = sum(
+                1
+                for ly in active_layers
+                if name in ly.obj_bounds
+            )
+            if layers_done <= 0:
+                status = "waiting"
+            elif eff_z >= info.last_z - 0.05:
+                status = "complete"
+            else:
+                status = "printing"
+            objects_status.append(
+                {
+                    "name": name,
+                    "label": info.label,
+                    "status": status,
+                    "layers_done": layers_done,
+                    "layers_total": info.layer_count,
+                    "height_mm": info.last_z,
+                    "x_min": info.x_min,
+                    "x_max": info.x_max,
+                    "y_min": info.y_min,
+                    "y_max": info.y_max,
+                }
+            )
+
+        real_objects = [o for o in objects_status if o["name"].upper() != "NONMESH"]
+        if len(real_objects) > 1:
+            obj_label = f"{len(real_objects)} objects"
+            obj_lines = "; ".join(
+                f"{o['label']} [{o['status']}, layer {o['layers_done']}/{o['layers_total']}, "
+                f"X:{o['x_min']:.0f}..{o['x_max']:.0f} Y:{o['y_min']:.0f}..{o['y_max']:.0f}, "
+                f"height {o['height_mm']:.1f}mm]"
+                for o in real_objects
+            )
+            summary = (
+                f"Model '{os.path.splitext(model.filename)[0]}' has {len(real_objects)} separate objects on the bed: "
+                f"{obj_lines}. At Z={eff_z:.2f}mm / {model.z_max:.2f}mm "
+                f"(Layer {completed_count}/{model.total_layers}, {height_frac * 100:.0f}% height). "
+                f"Overall expected footprint on bed: {w_mm:.1f}mm wide (X:{fp_xmin:.0f}..{fp_xmax:.0f}) × "
+                f"{d_mm:.1f}mm deep (Y:{fp_ymin:.0f}..{fp_ymax:.0f})."
+            )
+        else:
+            obj_label = (
+                real_objects[0]["name"]
+                if real_objects
+                else (model.object_name or os.path.splitext(model.filename)[0])
+            )
+            summary = (
+                f"Model '{obj_label}': at Z={eff_z:.2f}mm / {model.z_max:.2f}mm "
+                f"(Layer {completed_count}/{model.total_layers}, {height_frac * 100:.0f}% height). "
+                f"Expected footprint on bed: {w_mm:.1f}mm wide (X:{fp_xmin:.0f}..{fp_xmax:.0f}) × "
+                f"{d_mm:.1f}mm deep (Y:{fp_ymin:.0f}..{fp_ymax:.0f}); "
+                f"current top layer cross-section: {active_w:.1f}mm × {active_d:.1f}mm."
+            )
 
         ref_jpeg = self.render_expected_model_jpeg(model, eff_z, active_layers)
 
-        return ExpectedModelAtZ(
+        state = ExpectedModelAtZ(
             filename=model.filename,
             object_name=obj_label,
             current_z=eff_z,
@@ -193,7 +290,11 @@ class GCodeModelAnalyzer:
             active_y_max=top_layer.y_max,
             summary_text=summary,
             reference_jpeg=ref_jpeg,
+            objects_status=objects_status,
         )
+        self._render_cache_key = cache_key
+        self._render_cache_value = state
+        return state
 
     def _resolve_filepath(self, filename_or_path: Optional[str]) -> Optional[str]:
         if filename_or_path:
@@ -245,13 +346,27 @@ class GCodeModelAnalyzer:
         ):
             return self._cached_model
 
+        # Only one thread parses a (potentially 60MB+) file at a time; others wait and reuse the result
+        with self._parse_lock:
+            if (
+                self._cached_model is not None
+                and self._cached_model.filepath == filepath
+                and abs(self._cached_model.mtime - mtime) < 0.01
+            ):
+                return self._cached_model
+            return self._parse_and_cache(filepath, mtime)
+
+    def _parse_and_cache(self, filepath: str, mtime: float) -> Optional[ParsedGCodeModel]:
         try:
             parsed = self._parse_gcode_file(filepath, mtime)
             self._cached_model = parsed
+            self._render_cache_key = None
+            self._render_cache_value = None
             logger.info(
-                "Parsed G-code model '%s': %d layers, Z=%.2fmm, X=[%.1f..%.1f], Y=[%.1f..%.1f]",
+                "Parsed G-code model '%s': %d layers, %d objects, Z=%.2fmm, X=[%.1f..%.1f], Y=[%.1f..%.1f]",
                 parsed.filename,
                 parsed.total_layers,
+                len(parsed.object_order),
                 parsed.z_max,
                 parsed.x_min,
                 parsed.x_max,
@@ -279,12 +394,19 @@ class GCodeModelAnalyzer:
         relative_e = False
         is_outer_wall = True
         in_skirt_or_support = False
+        default_obj = "(model)"
+        cur_obj = default_obj
+        saw_object_marker = False
+        objects: Dict[str, ObjectInfo] = {}
+        object_order: List[str] = []
 
         layers_by_z: Dict[float, LayerSlice] = {}
         layer_counter = 0
 
-        # Cap segments per layer so memory and rendering stay ultra-fast on Raspberry Pi
-        max_segments_per_layer = 160
+        # Per-object, per-layer cap: each object gets its own evenly-decimated segment budget so a
+        # large first object can never starve the others (multi-object plates).
+        max_segments_per_obj_layer = 700
+        min_seg_len = 1.5
 
         with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
             for raw_line in f:
@@ -336,10 +458,20 @@ class GCodeModelAnalyzer:
                         t_val = line.split(":", 1)[1].strip().upper()
                         is_outer_wall = "WALL-OUTER" in t_val or "EXTERNAL" in t_val or "PERIMETER" in t_val
                         in_skirt_or_support = "SKIRT" in t_val or "BRIM" in t_val
+                    elif line.startswith(";MESH:"):
+                        mesh_name = line.split(":", 1)[1].strip()
+                        if mesh_name:
+                            cur_obj = mesh_name
+                            saw_object_marker = True
                     continue
 
                 if line.startswith("@Object"):
-                    model.object_name = line.split(" ", 1)[1].strip()
+                    parts_obj = line.split(" ", 1)
+                    obj_name = parts_obj[1].strip() if len(parts_obj) > 1 else ""
+                    if obj_name:
+                        cur_obj = obj_name
+                        saw_object_marker = True
+                        model.object_name = obj_name
                     continue
 
                 # Strip inline comments
@@ -419,9 +551,55 @@ class GCodeModelAnalyzer:
                         ly.y_max = max(ly.y_max, y0, y1)
                         ly.extrusion_length_mm += e_delta
 
-                        if len(ly.segments) < max_segments_per_layer or is_outer_wall:
-                            if len(ly.segments) < max_segments_per_layer * 2:
-                                ly.segments.append((x0, y0, x1, y1, is_outer_wall))
+                        # Per-object bookkeeping (bounds, layer presence, evenly-decimated outline segments)
+                        obj_info = objects.get(cur_obj)
+                        if obj_info is None:
+                            obj_info = ObjectInfo(name=cur_obj)
+                            objects[cur_obj] = obj_info
+                            object_order.append(cur_obj)
+                        obj_info.x_min = min(obj_info.x_min, x0, x1)
+                        obj_info.y_min = min(obj_info.y_min, y0, y1)
+                        obj_info.x_max = max(obj_info.x_max, x0, x1)
+                        obj_info.y_max = max(obj_info.y_max, y0, y1)
+                        obj_info.first_z = min(obj_info.first_z, z_key)
+                        obj_info.last_z = max(obj_info.last_z, z_key)
+
+                        ob = ly.obj_bounds.get(cur_obj)
+                        if ob is None:
+                            ly.obj_bounds[cur_obj] = [
+                                min(x0, x1),
+                                min(y0, y1),
+                                max(x0, x1),
+                                max(y0, y1),
+                            ]
+                            ly.obj_segments[cur_obj] = []
+                            obj_info.layer_count += 1
+                        else:
+                            ob[0] = min(ob[0], x0, x1)
+                            ob[1] = min(ob[1], y0, y1)
+                            ob[2] = max(ob[2], x0, x1)
+                            ob[3] = max(ob[3], y0, y1)
+
+                        # Outline (outer wall) moves drive the visual. Tiny consecutive arc moves are merged
+                        # into longer chords (>= min_seg_len mm) so outlines stay continuous but compact.
+                        if is_outer_wall:
+                            seg_list = ly.obj_segments[cur_obj]
+                            anc = ly.obj_anchor.get(cur_obj)
+                            if (
+                                anc is None
+                                or abs(anc[2] - x0) > 0.05
+                                or abs(anc[3] - y0) > 0.05
+                            ):
+                                anc = [x0, y0, x1, y1]  # new contiguous path
+                            else:
+                                anc[2], anc[3] = x1, y1
+                            if (
+                                math.hypot(x1 - anc[0], y1 - anc[1]) >= min_seg_len
+                                and len(seg_list) < max_segments_per_obj_layer
+                            ):
+                                seg_list.append((anc[0], anc[1], x1, y1, True))
+                                anc[0], anc[1] = x1, y1
+                            ly.obj_anchor[cur_obj] = anc
 
                 cur_x, cur_y, cur_z = new_x, new_y, new_z
 
@@ -432,7 +610,28 @@ class GCodeModelAnalyzer:
         ]
         for idx, ly in enumerate(sorted_layers):
             ly.layer_index = idx
+            # Fallback for files without outer-wall markers: keep a decimated sample of every object
+            merged: List[Tuple[float, float, float, float, bool]] = []
+            for name, segs in ly.obj_segments.items():
+                merged.extend(segs)
+            ly.segments = merged
+            ly.obj_anchor = {}
 
+        # Files without any @Object / ;MESH: markers: label the single object after the file name
+        if not saw_object_marker and default_obj in objects:
+            real_name = os.path.splitext(filename)[0]
+            info = objects.pop(default_obj)
+            info.name = real_name
+            objects[real_name] = info
+            object_order = [real_name if n == default_obj else n for n in object_order]
+            for ly in sorted_layers:
+                for d in (ly.obj_bounds, ly.obj_segments, ly.obj_anchor):
+                    if default_obj in d:
+                        d[real_name] = d.pop(default_obj)
+            model.object_name = model.object_name or real_name
+
+        model.objects = objects
+        model.object_order = object_order
         model.layers = sorted_layers
         model.total_layers = len(sorted_layers)
         if sorted_layers:
@@ -445,6 +644,17 @@ class GCodeModelAnalyzer:
 
         return model
 
+    # Distinct per-object colours (printed volume); gold is reserved for the current Z layer
+    OBJECT_COLORS: List[Tuple[int, int, int]] = [
+        (52, 211, 153),   # emerald
+        (56, 189, 248),   # sky
+        (244, 114, 182),  # pink
+        (251, 146, 60),   # orange
+        (163, 230, 53),   # lime
+        (167, 139, 250),  # violet
+        (45, 212, 191),   # teal
+    ]
+
     def render_expected_model_jpeg(
         self,
         model: ParsedGCodeModel,
@@ -453,11 +663,12 @@ class GCodeModelAnalyzer:
         size: Tuple[int, int] = (640, 480),
     ) -> bytes:
         """
-        Render a visual reference image showing what the 3D model on the build plate
+        Render a visual reference image showing what ALL objects on the build plate
         SHOULD look like at `current_z`:
-          - Left half: 3D Isometric view (ghosted full model + solid emerald/cyan completed layers up to Z)
-          - Right top: Front profile silhouette (X vs Z) with current Z nozzle line
-          - Right bottom: Top-down bed footprint (X vs Y) at current Z
+          - Left: 3D isometric view (each object in its own colour when printed, gold = current Z layer,
+            dark = not yet printed) plus a legend with per-object progress
+          - Right top: Front profile (X vs Z) per object with current Z line
+          - Right bottom: Top-down plate view showing every object (waiting / printing / complete)
         """
         w, h = size
         img = Image.new("RGB", (w, h), color=(18, 22, 30))
@@ -475,19 +686,54 @@ class GCodeModelAnalyzer:
             if not active_layers:
                 active_layers = [model.layers[0]]
 
+        names = list(model.object_order) or sorted(
+            {n for ly in model.layers for n in ly.obj_segments}
+        )
+        color_for = {
+            n: self.OBJECT_COLORS[i % len(self.OBJECT_COLORS)] for i, n in enumerate(names)
+        }
+
+        def obj_label(n: str) -> str:
+            info = model.objects.get(n)
+            return info.label if info else n
+
         cx = 0.5 * (model.x_min + model.x_max)
         cy = 0.5 * (model.y_min + model.y_max)
         span_x = max(10.0, model.width_mm)
         span_y = max(10.0, model.depth_mm)
         span_z = max(5.0, model.z_max)
 
+        top_active_z = active_layers[-1].z_height
+        top_ly = active_layers[-1]
+        pct_val = min(100.0, (current_z / model.z_max) * 100.0) if model.z_max > 0 else 100.0
+
+        # Per-object status at current Z
+        obj_state: Dict[str, Tuple[str, int, int]] = {}
+        for n in names:
+            info = model.objects.get(n)
+            total_l = info.layer_count if info else 0
+            done_l = sum(1 for ly in active_layers if n in ly.obj_bounds)
+            if done_l <= 0:
+                st = "waiting"
+            elif info is not None and current_z >= info.last_z - 0.05:
+                st = "complete"
+            else:
+                st = "printing"
+            obj_state[n] = (st, done_l, total_l)
+
         # ------------------------------------------------------------------
-        # 1. Left Panel: 3D Isometric Projection (x: 12..330, y: 36..440)
+        # Left panel layout: progress bar, isometric view, legend
         # ------------------------------------------------------------------
+        legend_names = names[:7]
+        legend_h = 14 + len(legend_names) * 11 + (11 if len(names) > 7 else 0)
+        vp_x0, vp_x1 = 18.0, 326.0
+        vp_y0 = 80.0
+        vp_y1 = max(vp_y0 + 200.0, float(h - 8 - legend_h - 6))
+
         cos30 = 0.8660254
         sin30 = 0.5
 
-        pad_mm = max(6.0, 0.12 * max(span_x, span_y))
+        pad_mm = max(6.0, 0.08 * max(span_x, span_y))
         bx0, bx1 = model.x_min - pad_mm, model.x_max + pad_mm
         by0, by1 = model.y_min - pad_mm, model.y_max + pad_mm
 
@@ -509,8 +755,6 @@ class GCodeModelAnalyzer:
         ry_min = min(c[1] for c in corners)
         ry_max = max(c[1] for c in corners)
 
-        vp_x0, vp_x1 = 18.0, 326.0
-        vp_y0, vp_y1 = 82.0, 434.0
         iso_scale = min(
             (vp_x1 - vp_x0) / max(1.0, rx_max - rx_min),
             (vp_y1 - vp_y0) / max(1.0, ry_max - ry_min),
@@ -522,8 +766,7 @@ class GCodeModelAnalyzer:
             rx, ry = _raw_iso(x, y, z)
             return int(iso_cx + rx * iso_scale), int(iso_by + ry * iso_scale)
 
-        # Draw Z-progression bar at top of Left Panel (y: 56..72)
-        pct_val = min(100.0, (current_z / model.z_max) * 100.0) if model.z_max > 0 else 100.0
+        # Progress bar
         draw.text(
             (16, 38),
             f"3D Build Progress: Layer {len(active_layers)}/{model.total_layers} ({pct_val:.1f}%)",
@@ -545,7 +788,7 @@ class GCodeModelAnalyzer:
             font=font,
         )
 
-        # Draw build plate grid under model in isometric view
+        # Build plate
         bed_poly = [
             to_iso(bx0, by0, 0.0),
             to_iso(bx1, by0, 0.0),
@@ -554,67 +797,97 @@ class GCodeModelAnalyzer:
         ]
         draw.polygon(bed_poly, fill=(24, 30, 42), outline=(70, 92, 125))
 
-        # Sample future layers lightly and completed layers densely so every early layer is visible
+        # Sample layers lightly in the future and densely for completed layers
         future_layers = [ly for ly in model.layers if ly.z_height > current_z + 0.05]
-        fut_step = max(1, len(future_layers) // 55) if future_layers else 1
+        fut_step = max(1, len(future_layers) // 40) if future_layers else 1
         sampled_future = future_layers[::fut_step]
 
-        done_step = max(1, len(active_layers) // 65)
+        done_step = max(1, len(active_layers) // 30)
         sampled_done = active_layers[::done_step]
         if active_layers[-1] not in sampled_done:
             sampled_done.append(active_layers[-1])
 
-        top_active_z = active_layers[-1].z_height
+        def _thin(segs: List[Tuple[float, float, float, float, bool]], cap: int):
+            if len(segs) <= cap:
+                return segs
+            return segs[:: max(1, len(segs) // cap)]
 
-        # 1a. Draw ghosted future layers (> current_z) FIRST in the background
+        # 1a. Future layers (ghosted) for every object
         for ly in sampled_future:
-            for x0, y0, x1, y1, _ in ly.segments[::4]:
-                p0 = to_iso(x0, y0, ly.z_height)
-                p1 = to_iso(x1, y1, ly.z_height)
-                draw.line([p0, p1], fill=(38, 48, 65), width=1)
+            for segs in ly.obj_segments.values():
+                for x0, y0, x1, y1, _ in _thin(segs, 30):
+                    draw.line(
+                        [to_iso(x0, y0, ly.z_height), to_iso(x1, y1, ly.z_height)],
+                        fill=(38, 48, 65),
+                        width=1,
+                    )
 
-        # 1b. Draw completed layers (<= current_z) ON TOP as a solid emerald-green 3D volume
+        # 1b. Completed layers, each object in its own colour (darker at the base, brighter at the top)
         for ly in sampled_done:
-            is_top_active = abs(ly.z_height - top_active_z) < 0.01
-            if is_top_active and len(sampled_done) > 1:
+            if ly is top_ly and len(sampled_done) > 1:
                 continue
             rel_z = min(1.0, ly.z_height / max(0.2, top_active_z))
-            color = (
-                int(30 + 45 * rel_z),
-                int(155 + 85 * rel_z),
-                int(105 + 45 * (1.0 - rel_z)),
-            )
-            for x0, y0, x1, y1, _ in ly.segments:
-                p0 = to_iso(x0, y0, ly.z_height)
-                p1 = to_iso(x1, y1, ly.z_height)
-                draw.line([p0, p1], fill=color, width=2)
+            shade = 0.55 + 0.45 * rel_z
+            for n, segs in ly.obj_segments.items():
+                base = color_for.get(n, (52, 211, 153))
+                col = (int(base[0] * shade), int(base[1] * shade), int(base[2] * shade))
+                for x0, y0, x1, y1, _ in segs:
+                    draw.line(
+                        [to_iso(x0, y0, ly.z_height), to_iso(x1, y1, ly.z_height)],
+                        fill=col,
+                        width=2,
+                    )
 
-        # 1c. Draw active nozzle layer ON TOP OF ALL in bright gold + Z-slice plane outline
-        top_ly = active_layers[-1]
-        z_plane_poly = [
-            to_iso(bx0, by0, top_active_z),
-            to_iso(bx1, by0, top_active_z),
-            to_iso(bx1, by1, top_active_z),
-            to_iso(bx0, by1, top_active_z),
-        ]
-        draw.polygon(z_plane_poly, outline=(195, 165, 50))
-        for x0, y0, x1, y1, _ in top_ly.segments:
-            p0 = to_iso(x0, y0, top_active_z)
-            p1 = to_iso(x1, y1, top_active_z)
-            draw.line([p0, p1], fill=(255, 220, 45), width=2)
+        # 1c. Current nozzle layer on top in gold (all objects present on this layer) + Z plane
+        draw.polygon(
+            [
+                to_iso(bx0, by0, top_active_z),
+                to_iso(bx1, by0, top_active_z),
+                to_iso(bx1, by1, top_active_z),
+                to_iso(bx0, by1, top_active_z),
+            ],
+            outline=(195, 165, 50),
+        )
+        for segs in top_ly.obj_segments.values():
+            for x0, y0, x1, y1, _ in segs:
+                draw.line(
+                    [to_iso(x0, y0, top_active_z), to_iso(x1, y1, top_active_z)],
+                    fill=(255, 220, 45),
+                    width=2,
+                )
 
+        # Legend with per-object progress
+        ly0 = h - 8 - legend_h
         draw.text(
-            (16, 448),
-            "Green=Printed Volume | Gold=Current Z Layer | Dark=Unprinted",
-            fill=(140, 155, 175),
+            (16, ly0),
+            f"Objects on plate: {len(names)}   (gold = current Z layer)",
+            fill=(160, 210, 255),
             font=font,
         )
+        for i, n in enumerate(legend_names):
+            st, done_l, total_l = obj_state[n]
+            row_y = ly0 + 14 + i * 11
+            col = color_for[n] if st != "waiting" else (70, 82, 102)
+            draw.rectangle([16, row_y + 1, 24, row_y + 9], fill=col)
+            draw.text(
+                (30, row_y),
+                f"{obj_label(n)[:24]:<24} {st:<9} L{done_l}/{total_l}",
+                fill=(215, 225, 240) if st != "waiting" else (120, 132, 150),
+                font=font,
+            )
+        if len(names) > 7:
+            draw.text(
+                (30, ly0 + 14 + 7 * 11),
+                f"+ {len(names) - 7} more objects",
+                fill=(140, 155, 175),
+                font=font,
+            )
 
         # Divider line between Left and Right panels
         draw.line([(340, 32), (340, h - 10)], fill=(45, 55, 72), width=2)
 
         # ------------------------------------------------------------------
-        # 2. Right Top Panel: Front Silhouette (X vs Z) (x: 355..625, y: 55..235)
+        # 2. Right Top Panel: Front Profile (X vs Z) per object
         # ------------------------------------------------------------------
         draw.text((355, 40), "Front Profile (Width vs Height Z)", fill=(160, 210, 255), font=font)
         fp_x0, fp_y0, fp_x1, fp_y1 = 355, 60, 625, 230
@@ -626,23 +899,22 @@ class GCodeModelAnalyzer:
         )
         prof_cx = (fp_x0 + fp_x1) // 2
         prof_by = fp_y1 - 12
-
-        # Bed baseline
         draw.line([(fp_x0 + 8, prof_by), (fp_x1 - 8, prof_by)], fill=(100, 120, 150), width=2)
 
         for ly in sampled_future:
             py = int(prof_by - ly.z_height * prof_scale)
-            px0 = int(prof_cx + (ly.x_min - cx) * prof_scale)
-            px1 = int(prof_cx + (ly.x_max - cx) * prof_scale)
-            draw.line([(px0, py), (px1, py)], fill=(50, 62, 82), width=2)
+            for b in ly.obj_bounds.values():
+                px0 = int(prof_cx + (b[0] - cx) * prof_scale)
+                px1 = int(prof_cx + (b[2] - cx) * prof_scale)
+                draw.line([(px0, py), (px1, py)], fill=(50, 62, 82), width=2)
 
         for ly in sampled_done:
             py = int(prof_by - ly.z_height * prof_scale)
-            px0 = int(prof_cx + (ly.x_min - cx) * prof_scale)
-            px1 = int(prof_cx + (ly.x_max - cx) * prof_scale)
-            draw.line([(px0, py), (px1, py)], fill=(55, 220, 135), width=2)
+            for n, b in ly.obj_bounds.items():
+                px0 = int(prof_cx + (b[0] - cx) * prof_scale)
+                px1 = int(prof_cx + (b[2] - cx) * prof_scale)
+                draw.line([(px0, py), (px1, py)], fill=color_for.get(n, (55, 220, 135)), width=2)
 
-        # Current Z indicator line
         cur_py = int(prof_by - min(model.z_max, current_z) * prof_scale)
         draw.line([(fp_x0 + 6, cur_py), (fp_x1 - 6, cur_py)], fill=(255, 205, 55), width=2)
         draw.text(
@@ -653,11 +925,11 @@ class GCodeModelAnalyzer:
         )
 
         # ------------------------------------------------------------------
-        # 3. Right Bottom Panel: Top-Down Footprint (X vs Y) (x: 355..625, y: 265..445)
+        # 3. Right Bottom Panel: Top-Down plate view showing every object
         # ------------------------------------------------------------------
         draw.text(
             (355, 245),
-            f"Top-Down Slice @ Layer {len(active_layers)} (Z={current_z:.2f}mm)",
+            f"Top-Down Plate @ Layer {len(active_layers)} (Z={current_z:.2f}mm)",
             fill=(160, 210, 255),
             font=font,
         )
@@ -666,27 +938,42 @@ class GCodeModelAnalyzer:
 
         td_scale = min(
             (td_x1 - td_x0 - 24) / max(10.0, span_x),
-            (td_y1 - td_y0 - 24) / max(10.0, span_y),
+            (td_y1 - td_y0 - 36) / max(10.0, span_y),
         )
         td_cx = (td_x0 + td_x1) // 2
-        td_cy = (td_y0 + td_y1) // 2
+        td_cy = (td_y0 + td_y1 - 14) // 2
 
-        # Draw base layer footprint in green and current active layer in gold
-        base_ly = active_layers[0]
-        top_ly = active_layers[-1]
-        for x0, y0, x1, y1, _ in base_ly.segments[::2]:
-            p0 = (int(td_cx + (x0 - cx) * td_scale), int(td_cy - (y0 - cy) * td_scale))
-            p1 = (int(td_cx + (x1 - cx) * td_scale), int(td_cy - (y1 - cy) * td_scale))
-            draw.line([p0, p1], fill=(55, 165, 115), width=1)
+        def to_td(x: float, y: float) -> Tuple[int, int]:
+            return int(td_cx + (x - cx) * td_scale), int(td_cy - (y - cy) * td_scale)
 
-        for x0, y0, x1, y1, _ in top_ly.segments:
-            p0 = (int(td_cx + (x0 - cx) * td_scale), int(td_cy - (y0 - cy) * td_scale))
-            p1 = (int(td_cx + (x1 - cx) * td_scale), int(td_cy - (y1 - cy) * td_scale))
-            draw.line([p0, p1], fill=(255, 215, 60), width=2)
+        first_layer_of: Dict[str, LayerSlice] = {}
+        for ly in model.layers:
+            for n in ly.obj_segments:
+                if n not in first_layer_of:
+                    first_layer_of[n] = ly
+
+        # Objects not started yet: ghost footprint from their first layer
+        for n in names:
+            if obj_state[n][0] == "waiting" and n in first_layer_of:
+                for x0, y0, x1, y1, _ in _thin(first_layer_of[n].obj_segments[n], 80):
+                    draw.line([to_td(x0, y0), to_td(x1, y1)], fill=(52, 64, 86), width=1)
+
+        # Started objects: their most recent layer (gold when it is the layer being printed now)
+        remaining = {n for n in names if obj_state[n][0] != "waiting"}
+        for ly in reversed(active_layers):
+            if not remaining:
+                break
+            for n in list(remaining):
+                if n in ly.obj_segments:
+                    remaining.discard(n)
+                    is_current = ly is top_ly
+                    col = (255, 215, 60) if is_current else color_for.get(n, (55, 165, 115))
+                    for x0, y0, x1, y1, _ in ly.obj_segments[n]:
+                        draw.line([to_td(x0, y0), to_td(x1, y1)], fill=col, width=2 if is_current else 1)
 
         draw.text(
             (td_x0 + 8, td_y1 - 16),
-            f"Size: {model.width_mm:.1f}mm (W) x {model.depth_mm:.1f}mm (D) x {model.z_max:.1f}mm (H)",
+            f"Plate: {model.width_mm:.0f}mm (W) x {model.depth_mm:.0f}mm (D) x {model.z_max:.1f}mm (H)",
             fill=(185, 200, 220),
             font=font,
         )
@@ -695,11 +982,10 @@ class GCodeModelAnalyzer:
         # Top Header Bar
         # ------------------------------------------------------------------
         draw.rectangle([0, 0, w, 28], fill=(32, 68, 115))
-        obj_label = (model.object_name or model.filename)[:34]
-        pct = min(100.0, (current_z / model.z_max) * 100.0) if model.z_max > 0 else 100.0
+        title = os.path.splitext(model.filename)[0].replace("CFFFP_", "")[:30]
         header = (
-            f"Expected G-Code Model: {obj_label} | "
-            f"Z: {current_z:.2f}/{model.z_max:.2f}mm ({pct:.0f}%, Layer {len(active_layers)}/{model.total_layers})"
+            f"Expected G-Code Model: {title} | {len(names)} object{'s' if len(names) != 1 else ''} | "
+            f"Z: {current_z:.2f}/{model.z_max:.2f}mm ({pct_val:.0f}%, Layer {len(active_layers)}/{model.total_layers})"
         )
         draw.text((8, 8), header, fill=(255, 255, 255), font=font)
 
