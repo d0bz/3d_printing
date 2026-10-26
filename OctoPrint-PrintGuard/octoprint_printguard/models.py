@@ -67,6 +67,7 @@ class PrinterContext:
     filename: Optional[str] = None
     filepath: Optional[str] = None
     expected_model_summary: Optional[str] = None
+    capture_note: Optional[str] = None
     expected_model_jpeg: Optional[bytes] = field(default=None, repr=False)
 
     def to_dict(self) -> Dict[str, Any]:

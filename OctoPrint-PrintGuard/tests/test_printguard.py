@@ -694,16 +694,20 @@ def test_smart_gate_waits_for_clear_view_and_bypasses_when_unknown():
     ]
     # No nozzle position yet: capture immediately
     assert plugin._smart_gate()["open"] is True
-    # Toolhead right in front of the part (camera at 50,0): wait
-    plugin.on_gcode_sent(None, None, "G1 X110 Y110 E1", None, "G1")
+    # Bed slides in Y, camera 400mm in front of the nozzle row. Nozzle in front of the part (lower Y,
+    # same X): the part is behind the toolhead, so it is hidden
+    plugin.on_gcode_sent(None, None, "G1 X150 Y110 E1", None, "G1")
     gate = plugin._smart_gate()
-    assert gate["open"] is False and gate["hidden"] > 0.5
-    # Toolhead on the far side: capture
-    plugin.on_gcode_sent(None, None, "G1 X260 Y260 E2", None, "G1")
+    assert gate["open"] is False and gate["hidden"] > 0.3
+    # Nozzle behind the part (higher Y): everything printed is in front of it -> clear
+    plugin.on_gcode_sent(None, None, "G1 X150 Y260 E2", None, "G1")
+    assert plugin._smart_gate()["open"] is True
+    # Nozzle off to the side in X, level with the part: clear
+    plugin.on_gcode_sent(None, None, "G1 X280 Y150 E3", None, "G1")
     assert plugin._smart_gate()["open"] is True
     # Not printing: never gate
     plugin._printer.is_printing.return_value = False
-    plugin.on_gcode_sent(None, None, "G1 X110 Y110", None, "G1")
+    plugin.on_gcode_sent(None, None, "G1 X150 Y110", None, "G1")
     assert plugin._smart_gate()["open"] is True
 
 
@@ -774,3 +778,151 @@ def test_no_checks_during_print_start_delay():
     plugin.on_event("PrintStarted", {})
     plugin.stop_monitoring()
     assert plugin._start_delay_until <= _time.time() + 0.5
+
+
+# ---------------------------------------------------------------------------
+# No-pause aimed capture (look-ahead, 2 shots, tolerance ladder)
+# ---------------------------------------------------------------------------
+import math as _math  # noqa: E402
+import time as _time_mod  # noqa: E402
+
+from octoprint_printguard.smart_capture import (  # noqa: E402
+    choose_best_shot,
+    find_windows,
+    hidden_fraction_moving_bed,
+    lookahead_moves,
+    shadow_polygon,
+    tolerance_for,
+)
+
+_RING = [(150 + 20 * _math.cos(a / 10.0), 150 + 20 * _math.sin(a / 10.0)) for a in range(63)]
+
+
+def test_moving_bed_geometry_hidden_strip_behind_the_nozzle():
+    h = lambda nxy: hidden_fraction_moving_bed(nxy, _RING, 50.0, 0.0, 400.0, 60.0)  # noqa: E731
+    assert h((150.0, 110.0)) > 0.4  # part is behind the nozzle in the camera's line of sight
+    assert h((150.0, 260.0)) == pytest.approx(0.0)  # nozzle behind the part: nothing hidden
+    assert h((280.0, 150.0)) == pytest.approx(0.0)  # nozzle far to the side
+    # The shadow strip widens slowly with distance (D=400): ~+0.075mm per mm behind the nozzle
+    poly = shadow_polygon((50.0, -290.0), (150.0, 110.0), 60.0, 100.0)
+    near_w = _math.dist(poly[0], poly[1])
+    far_w = _math.dist(poly[2], poly[3])
+    assert near_w == pytest.approx(60.0, abs=0.5)
+    assert far_w == pytest.approx(60.0 * (1.0 + 100.0 / _math.hypot(100.0, 400.0)), rel=0.02)
+
+
+def test_nozzle_history_position_at_and_recent():
+    t = NozzleTracker()
+    t.on_sent("G1 X10 Y10")
+    _time_mod.sleep(0.05)
+    mid = _time_mod.time()
+    _time_mod.sleep(0.05)
+    t.on_sent("G1 X20 Y30")
+    assert t.position_at(mid) == (10.0, 10.0)  # position when the earlier move was current
+    assert t.position_at(_time_mod.time()) == (20.0, 30.0)
+    assert len(t.recent(mid)) == 1
+
+
+def test_lookahead_predicts_clear_window_from_gcode(tmp_path):
+    # Nozzle sweeps along Y at X=150 from 100 to 300 mm at 100 mm/s (G1 F6000): ~2.2 s with the speed factor
+    lines = [";LAYER:0", "G1 X150 Y100 F6000"]
+    for y in range(100, 301, 5):
+        lines.append(f"G1 X150 Y{y} F6000")
+    f = tmp_path / "sweep.gcode"
+    f.write_text("\n".join(lines) + "\n")
+    moves = lookahead_moves(str(f), 0, (150.0, 100.0), 6000.0, horizon_s=60.0, min_step_s=0.05)
+    assert moves and moves[-1][2] == pytest.approx(300.0)
+    now = 1000.0
+    clear = lambda xy: hidden_fraction_moving_bed(xy, _RING, 50.0, 0.0, 400.0, 60.0) <= 0.15  # noqa: E731
+    timeline = [(now + 1.5 + t_rel, x, y) for t_rel, x, y in moves]
+    windows = find_windows(timeline, clear, min_len=0.1)
+    assert windows, "the sweep ends behind the part so there must be a clear window"
+    start, end = windows[-1]
+    assert end == pytest.approx(timeline[-1][0])  # still clear when the sweep ends
+    # The window opens only once the nozzle is behind (beyond) the ring: Y >= about 150
+    first_clear = next(y for (t_abs, x, y) in timeline if t_abs >= start)
+    assert first_clear >= 150.0
+
+
+def test_tolerance_ladder_and_best_shot_choice():
+    ladder = [(0.0, 0.15), (30.0, 0.25), (60.0, 0.35)]
+    assert tolerance_for(0.0, ladder) == 0.15
+    assert tolerance_for(29.9, ladder) == 0.15
+    assert tolerance_for(45.0, ladder) == 0.25
+    assert tolerance_for(300.0, ladder) == 0.35
+    a = {"frame": b"a", "hidden": 0.20}
+    b = {"frame": b"b", "hidden": 0.04}
+    c = {"frame": b"c", "hidden": 0.04}
+    assert choose_best_shot([a, b])["frame"] == b"b"
+    assert choose_best_shot([b, c])["frame"] == b"b"  # tie: earlier (autofocused) shot
+    assert choose_best_shot([{"frame": b"x", "hidden": None}, a])["frame"] == b"a"
+    assert choose_best_shot([]) is None
+
+
+def _aim_plugin(nozzle_cmd, max_wait=1):
+    plugin = PrintGuardPlugin()
+    plugin._settings = _FakeSettings(
+        {"smart_capture_max_wait_seconds": max_wait, "burst_gap_seconds": 0.05, "planner_lead_s": 0.0}
+    )
+    plugin._printer = MagicMock()
+    plugin._printer.is_printing.return_value = True
+    plugin._printer.get_current_data.return_value = {"progress": {"completion": 5.0}, "job": {"file": {}}}
+    plugin._printer.get_current_temperatures.return_value = {}
+    plugin._gate_layer_points = list(_RING)
+    plugin._build_printer_context = lambda: PrinterContext(is_printing=True, current_z=2.0)  # type: ignore
+    calls = []
+
+    def fake_fetch(cheap=False):
+        calls.append(cheap)
+        return _make_clean_print_jpeg()
+
+    plugin.fetch_snapshot = fake_fetch  # type: ignore[assignment]
+    plugin.on_gcode_sent(None, None, nozzle_cmd, None, "G1")
+    return plugin, calls
+
+
+def test_aimed_capture_takes_two_shots_when_view_is_clear_and_does_not_pause():
+    plugin, calls = _aim_plugin("G1 X150 Y260 E1")  # nozzle behind the part: clear view
+    frame, meta = plugin._aim_capture()
+    assert frame
+    assert calls == [False, True]  # shot A: autofocus capture, shot B: plain snapshot only
+    assert meta["hidden"] == pytest.approx(0.0)
+    assert meta["flagged"] is False
+    assert "2 shot" in meta["summary"]
+    assert not plugin._printer.pause_print.called  # never pauses the print
+    assert not plugin._printer.commands.called  # never sends G-code
+
+
+def test_aimed_capture_falls_back_to_flagged_best_effort_when_no_window():
+    plugin, calls = _aim_plugin("G1 X150 Y110 E1")  # nozzle in front of the part for the whole wait
+    frame, meta = plugin._aim_capture()
+    assert frame
+    assert meta["flagged"] is True and meta["hidden"] > 0.3
+    assert "partially hidden" in meta["summary"]
+    assert "unknown" in (meta["note"] or "")
+    assert not plugin._printer.pause_print.called
+
+
+def test_vision_prompt_carries_the_hidden_share_note():
+    from octoprint_printguard.vision_providers import build_user_prompt
+
+    ctx = PrinterContext(is_printing=True, current_z=3.0, capture_note="the toolhead hid about 22% of the layer")
+    assert "Camera Frame Note: the toolhead hid about 22% of the layer" in build_user_prompt(ctx)
+
+
+def test_overlay_with_moving_bed_shadow_renders(tmp_path):
+    (tmp_path / "p.gcode").write_text(
+        "\n".join([";LAYER:0", "@Object a.stl", "G0 X80 Y80 Z0.2", ";TYPE:WALL-OUTER",
+                   "G1 X120 Y80 E1", "G1 X120 Y120 E2", "G1 X80 Y120 E3", "G1 X80 Y80 E4"])
+    )
+    analyzer = GCodeModelAnalyzer(uploads_dir=str(tmp_path))
+    overlay = {
+        "nozzle": (100.0, 90.0),
+        "shadow_from": (50.0, -310.0),
+        "camera": None,
+        "toolhead_width": 60.0,
+        "label": "toolhead hides 40% of layer - waiting",
+    }
+    st = analyzer.get_expected_state("p.gcode", current_z=0.2, is_printing=True, overlay=overlay)
+    with Image.open(io.BytesIO(st.reference_jpeg)) as img:
+        assert img.size == (640, 480)

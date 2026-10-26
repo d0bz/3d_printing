@@ -154,6 +154,8 @@ def build_user_prompt(context: Optional[PrinterContext] = None, local_hint: Opti
             lines.append("Printer Telemetry: " + " | ".join(telemetry))
         if context.expected_model_summary:
             lines.append("Expected G-Code Model Geometry at Current Z: " + context.expected_model_summary)
+        if context.capture_note:
+            lines.append("Camera Frame Note: " + context.capture_note)
 
     if local_hint and (local_hint.sub_scores.no_extrusion >= 0.45 or local_hint.sub_scores.bed_detachment >= 0.45):
         lines.append(

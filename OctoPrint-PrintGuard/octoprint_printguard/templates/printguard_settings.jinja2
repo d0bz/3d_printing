@@ -136,7 +136,55 @@
                 <input type="checkbox" data-bind="checked: settings.plugins.printguard.smart_capture_enabled">
                 Take photos when the toolhead does not hide the layer being printed
             </label>
-            <span class="help-block">Camera position on the plate (mm), height, and toolhead width are used to work out what the toolhead hides from the camera.</span>
+            <span class="help-block">Camera X (mm), toolhead width and the camera distance below are used to work out what the toolhead hides from the camera.</span>
+        </div>
+    </div>
+
+    <div class="control-group">
+        <label class="control-label">Hybrid Capture Mode</label>
+        <div class="controls">
+            <select data-bind="value: settings.plugins.printguard.capture_mode">
+                <option value="lookahead">Look-ahead (predict a clear moment from the G-code, 2 shots, no pause)</option>
+                <option value="reactive">Reactive (wait until the view is clear)</option>
+                <option value="timer">Timer only (no smart capture for Hybrid checks)</option>
+            </select>
+            <span class="help-block">Look-ahead reads the upcoming G-code, times the phone autofocus to finish inside a clear window and takes 2 shots; the one with the least hidden print is analysed. The print is never paused and no G-code is sent.</span>
+        </div>
+    </div>
+
+    <div class="control-group">
+        <label class="control-label">Camera Distance To Nozzle Row (mm)</label>
+        <div class="controls">
+            <input type="number" step="10" min="0" class="input-small" data-bind="value: settings.plugins.printguard.camera_distance_mm">
+            <span class="help-block">For a printer whose bed slides in Y: how far the camera is in front of the nozzle row (default <code>400</code>). Camera Y below is only used when this is <code>0</code>.</span>
+        </div>
+    </div>
+
+    <div class="control-group">
+        <label class="control-label">Look-ahead / Planner Lead / Shot Gap</label>
+        <div class="controls">
+            <input type="number" step="10" min="10" class="input-mini" title="look-ahead seconds" data-bind="value: settings.plugins.printguard.lookahead_seconds">
+            <input type="number" step="0.1" min="0" class="input-mini" title="planner lead seconds" data-bind="value: settings.plugins.printguard.planner_lead_s">
+            <input type="number" step="0.1" min="0.2" class="input-mini" title="gap between the 2 shots (s)" data-bind="value: settings.plugins.printguard.burst_gap_seconds">
+            <span class="help-block">Seconds of G-code to look ahead (<code>120</code>), how far the printer runs behind the sent G-code (<code>1.5</code> s) and the gap between the two shots (<code>0.8</code> s).</span>
+        </div>
+    </div>
+
+    <div class="control-group">
+        <label class="control-label">Allowed Hidden Share (Hybrid, start / after 30 s / after 60 s)</label>
+        <div class="controls">
+            <input type="number" step="0.05" min="0" max="1" class="input-mini" data-bind="value: settings.plugins.printguard.hybrid_tolerance_start">
+            <input type="number" step="0.05" min="0" max="1" class="input-mini" data-bind="value: settings.plugins.printguard.hybrid_tolerance_mid">
+            <input type="number" step="0.05" min="0" max="1" class="input-mini" data-bind="value: settings.plugins.printguard.hybrid_tolerance_late">
+            <span class="help-block">The allowed hidden share relaxes while waiting for a window (defaults <code>0.15 / 0.25 / 0.35</code>). At the max wait the best frame is used and flagged as partially hidden.</span>
+        </div>
+    </div>
+
+    <div class="control-group">
+        <label class="control-label">Allowed Hidden Share (fast Local CV captures)</label>
+        <div class="controls">
+            <input type="number" step="0.05" min="0" max="1" class="input-mini" data-bind="value: settings.plugins.printguard.local_max_occluded_fraction">
+            <span class="help-block">Fast Local CV captures take one shot at the first moment the hidden share is at most this value (default <code>0.30</code>).</span>
         </div>
     </div>
 

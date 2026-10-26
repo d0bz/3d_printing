@@ -1034,22 +1034,22 @@ class GCodeModelAnalyzer:
         if overlay:
             cam = overlay.get("camera")
             noz = overlay.get("nozzle")
+            src = overlay.get("shadow_from") or cam
             tw = float(overlay.get("toolhead_width", 60.0))
-            if cam and noz:
-                from .smart_capture import shadow_wedge
+            if noz and src:
+                from .smart_capture import shadow_polygon
 
-                wedge = shadow_wedge(
-                    (cam[0], cam[1]),
+                poly = shadow_polygon(
+                    (src[0], src[1]),
                     (noz[0], noz[1]),
                     tw,
                     max(tb_x1 - tb_x0, tb_y1 - tb_y0) * 1.5,
                 )
-                if wedge:
-                    # Clip the wedge to the panel by drawing only its two rays + chord
-                    p_cam = to_td(*wedge[0])
+                if poly:
                     rect = (td_x0 + 1, td_y0 + 1, td_x1 - 1, td_y1 - 1)
-                    for far_pt in wedge[1:]:
-                        clipped = _clip_segment(p_cam, to_td(*far_pt), rect)
+                    pts_td = [to_td(px, py) for px, py in poly]
+                    for i in range(4):
+                        clipped = _clip_segment(pts_td[i], pts_td[(i + 1) % 4], rect)
                         if clipped:
                             draw.line([clipped[0], clipped[1]], fill=(190, 70, 70), width=1)
             if cam:

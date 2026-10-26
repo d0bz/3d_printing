@@ -70,7 +70,15 @@ from .models import (
     SubScores,
 )
 from .notifier import NotificationManager
-from .smart_capture import NozzleTracker, capture_window
+from .smart_capture import (
+    NozzleTracker,
+    camera_position,
+    choose_best_shot,
+    find_windows,
+    hidden_fraction_moving_bed,
+    lookahead_moves,
+    tolerance_for,
+)
 from .vision_providers import VisionAIClient
 
 
@@ -119,6 +127,7 @@ class PrintGuardPlugin(
         self._escalation_block_until: float = 0.0
         self._schedule: Dict[str, float] = {}
         self._start_delay_until: float = 0.0
+        self._af_duration: float = 2.0  # moving average of the phone autofocus capture time
         self._last_gate_push: float = 0.0
         self._last_gate_open: Optional[bool] = None
         self._last_result: Optional[DetectionResult] = None
@@ -224,6 +233,16 @@ class PrintGuardPlugin(
             "toolhead_width_mm": 60.0,
             "max_occluded_fraction": 0.15,
             "smart_capture_max_wait_seconds": 90,
+            # No-pause capture aiming (Hybrid checks): look-ahead on the G-code, 2 shots around a clear window
+            "capture_mode": "lookahead",  # "lookahead", "reactive", "timer"
+            "camera_distance_mm": 400.0,  # camera to nozzle row; >0 = bed slides, camera row follows the nozzle
+            "planner_lead_s": 1.5,
+            "lookahead_seconds": 120,
+            "burst_gap_seconds": 0.8,
+            "hybrid_tolerance_start": 0.15,
+            "hybrid_tolerance_mid": 0.25,
+            "hybrid_tolerance_late": 0.35,
+            "local_max_occluded_fraction": 0.30,
             "initial_grace_seconds": 45,
             "start_delay_seconds": 300,
             "detection_mode": "hybrid",  # "hybrid", "local_only", "vision_ai_only"
@@ -770,23 +789,41 @@ class PrintGuardPlugin(
             and int(self._get_setting("local_cv_interval_seconds", 30) or 0) > 0
         )
 
-    def _smart_gate(self) -> Dict[str, Any]:
+    def _camera_geometry(self) -> Dict[str, float]:
+        return {
+            "camera_x": float(self._get_setting("camera_x_mm", 50.0)),
+            "camera_y": float(self._get_setting("camera_y_mm", 0.0)),
+            "distance": float(self._get_setting("camera_distance_mm", 400.0) or 0.0),
+            "toolhead": float(self._get_setting("toolhead_width_mm", 60.0)),
+        }
+
+    def _hidden_at(self, xy: Any, points: Any = None) -> float:
+        g = self._camera_geometry()
+        return hidden_fraction_moving_bed(
+            (float(xy[0]), float(xy[1])),
+            self._gate_layer_points if points is None else points,
+            g["camera_x"],
+            g["camera_y"],
+            g["distance"],
+            g["toolhead"],
+        )
+
+    def _smart_gate(self, tolerance: Optional[float] = None) -> Dict[str, Any]:
         """Is the camera view of the layer being printed free of the toolhead's shadow right now?"""
         if not bool(self._get_setting("smart_capture_enabled", True)) or not self._is_printing():
             return {"open": True, "hidden": None, "reason": "bypass"}
+        if tolerance is None:
+            tolerance = float(self._get_setting("local_max_occluded_fraction", 0.30))
         nozzle = self._nozzle_tracker.position(max_age=20.0)
-        gate = capture_window(
-            (
-                float(self._get_setting("camera_x_mm", 50.0)),
-                float(self._get_setting("camera_y_mm", 0.0)),
-            ),
-            nozzle,
-            self._gate_layer_points,
-            float(self._get_setting("toolhead_width_mm", 60.0)),
-            float(self._get_setting("max_occluded_fraction", 0.15)),
-        )
-        gate["nozzle"] = list(nozzle) if nozzle else None
-        return gate
+        if nozzle is None or not self._gate_layer_points:
+            return {"open": True, "hidden": None, "reason": "no-position", "nozzle": list(nozzle) if nozzle else None}
+        hidden = self._hidden_at(nozzle)
+        return {
+            "open": hidden <= tolerance,
+            "hidden": hidden,
+            "reason": "ok" if hidden <= tolerance else "occluded",
+            "nozzle": list(nozzle),
+        }
 
     def _post_hybrid_wait(self, res: DetectionResult) -> float:
         """Seconds until the next scheduled Hybrid check (30 s verification re-check after an anomaly)."""
@@ -873,9 +910,15 @@ class PrintGuardPlugin(
             kind = "hybrid" if due_h <= due_l else "local"
             due_at = due
 
-            # Smart capture: wait (up to a limit) for the toolhead to leave the camera's line of sight
+            # Smart capture: wait (up to a limit) for the toolhead to leave the camera's line of sight.
+            # Hybrid checks in look-ahead mode aim their own shots (see _aim_capture) instead of waiting here.
             max_wait = max(0, int(self._get_setting("smart_capture_max_wait_seconds", 90)))
-            if not is_open:
+            aimed_hybrid = kind == "hybrid" and self._capture_mode() == "lookahead"
+            if kind == "hybrid" and self._capture_mode() == "reactive":
+                gate = self._smart_gate(float(self._get_setting("max_occluded_fraction", 0.15)))
+                self._gate_state = gate
+                is_open = bool(gate.get("open"))
+            if not is_open and not aimed_hybrid and self._capture_mode() != "timer":
                 if arm_since is None:
                     arm_since = now
                 if (now - arm_since) < max_wait:
@@ -897,7 +940,7 @@ class PrintGuardPlugin(
                     continue
                 if kind == "hybrid":
                     # Every scheduled interval check is a full Hybrid check (Local CV + Vision AI)
-                    res = self.run_single_check(force_vision_ai=True)
+                    res = self.run_single_check(force_vision_ai=True, aim=aimed_hybrid)
                     next_hybrid = time.time() + self._post_hybrid_wait(res)
                     next_local = time.time() + local_iv
                 else:
@@ -910,7 +953,9 @@ class PrintGuardPlugin(
                             "Local CV anomaly on %d consecutive ticks — escalating to Hybrid check",
                             int(self._get_setting("local_cv_escalate_consecutive", 2)),
                         )
-                        res = self.run_single_check(force_vision_ai=True)
+                        res = self.run_single_check(
+                            force_vision_ai=True, aim=self._capture_mode() == "lookahead"
+                        )
                         next_hybrid = time.time() + self._post_hybrid_wait(res)
                         next_local = time.time() + local_iv
             except Exception as exc:
@@ -921,6 +966,171 @@ class PrintGuardPlugin(
                     )
                 else:
                     next_local = time.time() + local_iv
+
+    def _capture_mode(self) -> str:
+        mode = str(self._get_setting("capture_mode", "lookahead")).strip().lower()
+        return mode if mode in ("lookahead", "reactive", "timer") else "lookahead"
+
+    def _hybrid_ladder(self) -> List[Tuple[float, float]]:
+        return [
+            (0.0, float(self._get_setting("hybrid_tolerance_start", 0.15))),
+            (30.0, float(self._get_setting("hybrid_tolerance_mid", 0.25))),
+            (60.0, float(self._get_setting("hybrid_tolerance_late", 0.35))),
+        ]
+
+    def _exposure_hidden(self, frame_time: float) -> Optional[float]:
+        """Hidden share of the layer for a frame captured at `frame_time` (lead + network latency compensated)."""
+        lead = float(self._get_setting("planner_lead_s", 1.5))
+        pos = self._nozzle_tracker.position_at(frame_time - 0.2 - lead)
+        if pos is None or not self._gate_layer_points:
+            return None
+        return self._hidden_at(pos)
+
+    def _predict_windows(
+        self, now: float, tol: float, context: PrinterContext
+    ) -> List[Tuple[float, float]]:
+        """Clear windows (absolute times) from already-sent moves plus a look-ahead on the G-code file."""
+        lead = float(self._get_setting("planner_lead_s", 1.5))
+        horizon = float(self._get_setting("lookahead_seconds", 120))
+        points = list(self._gate_layer_points)
+        timeline: List[Tuple[float, float, float]] = []
+        # Moves already sent but not executed yet run in [now, now + lead]
+        for ts, x, y in self._nozzle_tracker.recent(now - lead):
+            timeline.append((ts + lead, x, y))
+        pos = self._nozzle_tracker.position(max_age=20.0)
+        filepos = None
+        try:
+            filepos = ((self._printer.get_current_data() or {}).get("progress") or {}).get("filepos")
+        except Exception:
+            filepos = None
+        path = self._gcode_analyzer._resolve_filepath(context.filepath or context.filename)
+        if pos is not None and filepos and path and os.path.isfile(path):
+            for t_rel, x, y in lookahead_moves(path, int(filepos), pos, 3000.0, horizon):
+                timeline.append((now + lead + t_rel, x, y))
+        g = self._camera_geometry()
+
+        def is_clear(xy: Tuple[float, float]) -> bool:
+            return (
+                hidden_fraction_moving_bed(
+                    xy, points, g["camera_x"], g["camera_y"], g["distance"], g["toolhead"]
+                )
+                <= tol
+            )
+
+        return find_windows(timeline, is_clear, min_len=0.4)
+
+    def _sleep_until(self, target: float) -> bool:
+        """Sleep until `target` (wall clock); False if monitoring was stopped meanwhile."""
+        while True:
+            remaining = target - time.time()
+            if remaining <= 0:
+                return True
+            if self._stop_event.wait(min(remaining, 0.1)):
+                return False
+
+    def _aim_capture(self) -> Tuple[bytes, Dict[str, Any]]:
+        """
+        Capture a frame for a Hybrid check WITHOUT pausing the print: predict the next moment the toolhead does
+        not hide the layer (G-code look-ahead), time the phone autofocus so it finishes inside that window, then
+        take 2 shots and keep the one with the least hidden share. Tolerance relaxes while waiting.
+        """
+        started = time.time()
+        max_wait = max(1, int(self._get_setting("smart_capture_max_wait_seconds", 90)))
+        gap = float(self._get_setting("burst_gap_seconds", 0.8))
+        ladder = self._hybrid_ladder()
+        all_shots: List[Dict[str, Any]] = []
+
+        def finish(shot: Optional[Dict[str, Any]], mode: str, tol: float) -> Tuple[bytes, Dict[str, Any]]:
+            waited = time.time() - started
+            if shot is None:
+                frame = self.fetch_snapshot()
+                hidden = self._exposure_hidden(time.time())
+                shot = {"frame": frame, "hidden": hidden, "t": time.time()}
+            hidden = shot.get("hidden")
+            flagged = hidden is not None and float(hidden) > tol
+            if hidden is None:
+                summary = f"{mode}, position unknown, {len(all_shots) or 1} shot(s), waited {waited:.0f}s"
+                note = None
+            else:
+                summary = (
+                    f"{mode}, toolhead hid {float(hidden) * 100:.0f}% of the layer, "
+                    f"{max(1, len(all_shots))} shot(s), waited {waited:.0f}s"
+                    + (", partially hidden" if flagged else "")
+                )
+                note = (
+                    f"the toolhead hid about {float(hidden) * 100:.0f}% of the layer being printed in this frame"
+                    + (" (partially hidden; treat unseen areas as unknown and do not judge them)." if flagged else ".")
+                    if float(hidden) >= 0.05
+                    else None
+                )
+            self._last_capture = {
+                "ts": time.time(),
+                "kind": "hybrid",
+                "waited_s": round(waited, 1),
+                "hidden": hidden,
+                "reason": mode if not flagged else "best-effort",
+            }
+            return shot["frame"], {"summary": summary, "note": note, "hidden": hidden, "flagged": flagged}
+
+        while True:
+            now = time.time()
+            elapsed = now - started
+            tol = tolerance_for(elapsed, ladder)
+            context = self._build_printer_context()
+            if (
+                not self._is_printing()
+                or self._stop_event.is_set()
+                or not self._gate_layer_points
+                or self._nozzle_tracker.position(max_age=20.0) is None
+            ):
+                return finish(choose_best_shot(all_shots), "immediate", tol)
+
+            if elapsed >= max_wait:
+                return finish(choose_best_shot(all_shots), "best-effort", tol)
+
+            windows = self._predict_windows(now, tol, context)
+            af_s = max(0.3, self._af_duration if self._has_phone_camera() else 0.3)
+            plan = None
+            for ws, we in windows:
+                arrive = max(ws + 0.2, now + af_s)
+                if arrive <= we - 0.1 and (arrive - af_s - started) < (max_wait - 1.0):
+                    plan = (arrive - af_s, arrive)
+                    break
+            if plan is None:
+                # Nothing predicted (e.g. G-code not readable) but the view is clear right now: shoot now
+                now_hidden = self._exposure_hidden(now)
+                if now_hidden is not None and now_hidden <= tol:
+                    plan = (now, now + af_s)
+            if plan is None:
+                # No usable window in the look-ahead yet: wait a little, the tolerance keeps relaxing
+                if not self._sleep_until(time.time() + 1.0):
+                    return finish(choose_best_shot(all_shots), "immediate", tol)
+                continue
+
+            start_at, _arrive = plan
+            if not self._sleep_until(start_at):
+                return finish(choose_best_shot(all_shots), "immediate", tol)
+
+            # Shot A: autofocus capture timed to finish inside the window
+            t0 = time.time()
+            frame_a = self.fetch_snapshot()
+            t_a = time.time()
+            if self._has_phone_camera():
+                self._af_duration = 0.6 * self._af_duration + 0.4 * max(0.3, t_a - t0)
+            shot_a = {"frame": frame_a, "t": t_a, "hidden": self._exposure_hidden(t_a)}
+            all_shots.append(shot_a)
+
+            # Shot B: plain snapshot shortly after (focus is locked now)
+            self._sleep_until(t_a + gap)
+            frame_b = self.fetch_snapshot(cheap=True)
+            t_b = time.time()
+            shot_b = {"frame": frame_b, "t": t_b, "hidden": self._exposure_hidden(t_b)}
+            all_shots.append(shot_b)
+
+            best = choose_best_shot(all_shots)
+            if best is not None and best.get("hidden") is not None and float(best["hidden"]) <= tol:
+                return finish(best, "lookahead", tol)
+            # Missed the window: look for the next one (tolerance relaxes with time)
 
     @staticmethod
     def _next_local_time(due_at: float, t_after: float, interval: float) -> float:
@@ -1081,28 +1291,40 @@ class PrintGuardPlugin(
         self,
         snapshot_bytes: Optional[bytes] = None,
         force_vision_ai: bool = False,
+        aim: bool = False,
     ) -> DetectionResult:
         """Capture a frame (or use provided bytes), run failure detection, and execute actions."""
         if self._detector is None or self._notifier is None:
             self._rebuild_components()
 
         with self._analysis_lock:
-            return self._run_single_check_locked(snapshot_bytes, force_vision_ai)
+            return self._run_single_check_locked(snapshot_bytes, force_vision_ai, aim)
 
     def _run_single_check_locked(
         self,
         snapshot_bytes: Optional[bytes],
         force_vision_ai: bool,
+        aim: bool = False,
     ) -> DetectionResult:
-        raw_jpeg = snapshot_bytes if snapshot_bytes is not None else self.fetch_snapshot()
+        capture_meta: Optional[Dict[str, Any]] = None
+        if snapshot_bytes is not None:
+            raw_jpeg = snapshot_bytes
+        elif aim:
+            raw_jpeg, capture_meta = self._aim_capture()
+        else:
+            raw_jpeg = self.fetch_snapshot()
         self._latest_raw_jpeg = raw_jpeg
         context = self._build_printer_context()
+        if capture_meta:
+            context.capture_note = capture_meta.get("note")
 
         result = self._detector.analyze(  # type: ignore[union-attr]
             raw_jpeg,
             context=context,
             force_vision_ai=force_vision_ai or self._in_fast_recheck,
         )
+        if capture_meta and capture_meta.get("summary"):
+            result.explanation = f"{result.explanation} [Capture: {capture_meta['summary']}]"
         cv_limit_reached = self._register_cv_outcome(result)
 
         # Track consecutive failures
@@ -1572,18 +1794,20 @@ class PrintGuardPlugin(
         overlay: Optional[Dict[str, Any]] = None
         if show_overlay:
             nozzle = self._nozzle_tracker.position(max_age=60.0) if ctx.is_printing else None
+            g = self._camera_geometry()
             gate = self._smart_gate() if nozzle else {}
             hidden = gate.get("hidden")
             overlay = {
-                "camera": (
-                    float(self._get_setting("camera_x_mm", 50.0)),
-                    float(self._get_setting("camera_y_mm", 0.0)),
-                ),
                 "nozzle": nozzle,
-                "toolhead_width": float(self._get_setting("toolhead_width_mm", 60.0)),
+                "toolhead_width": g["toolhead"],
+                "shadow_from": (
+                    camera_position(nozzle, g["camera_x"], g["camera_y"], g["distance"]) if nozzle else None
+                ),
+                # a camera marker only makes sense for a fixed camera point (no moving bed)
+                "camera": (g["camera_x"], g["camera_y"]) if g["distance"] <= 0 else None,
                 "label": (
-                    f"nozzle hides {hidden * 100:.0f}% of layer"
-                    + (" - capture OK" if gate.get("open") else " - waiting")
+                    f"toolhead hides {hidden * 100:.0f}% of layer"
+                    + (" - clear view" if gate.get("open") else " - waiting")
                     if hidden is not None
                     else None
                 ),
