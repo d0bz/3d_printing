@@ -885,7 +885,8 @@ class PrintGuardPlugin(
                     next_hybrid = time.time() + 5
                     continue
                 if kind == "hybrid":
-                    res = self.run_single_check(force_vision_ai=self._in_fast_recheck)
+                    # Every scheduled interval check is a full Hybrid check (Local CV + Vision AI)
+                    res = self.run_single_check(force_vision_ai=True)
                     next_hybrid = time.time() + self._post_hybrid_wait(res)
                     next_local = time.time() + local_iv
                 else:

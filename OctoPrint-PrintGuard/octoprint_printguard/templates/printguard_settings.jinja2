@@ -168,11 +168,9 @@
     </div>
 
     <div class="control-group">
-        <label class="control-label">Vision AI Check Every N Checks</label>
+        <label class="control-label">Hybrid Checks</label>
         <div class="controls">
-            <input type="number" class="input-small" min="1" max="100"
-                   data-bind="value: settings.plugins.printguard.vision_ai_periodic_interval">
-            <span class="help-block">In <strong>Hybrid</strong> mode, Local CV runs every check interval, and Vision AI (Gemini/OpenAI/Ollama) is called every <code>N</code> checks (or immediately if Local CV detects a suspicion). Default <code>1</code>: every scheduled check (the interval above) is a full Hybrid check with Vision AI, while the fast Local CV captures cover the time in between. Values above 1 make most scheduled checks Local CV only.</span>
+            <span class="help-block">Every scheduled check (the Check Interval above) is always a full Hybrid check: Local CV + Vision AI + expected 3D model. The fast Local CV captures run in between (see below).</span>
         </div>
     </div>
 
