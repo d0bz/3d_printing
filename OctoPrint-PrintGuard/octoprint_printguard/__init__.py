@@ -229,7 +229,7 @@ class PrintGuardPlugin(
             "warning_threshold": 0.45,
             "failure_threshold": 0.70,
             "escalation_threshold": 0.35,
-            "vision_ai_periodic_interval": 5,
+            "vision_ai_periodic_interval": 1,
             "consecutive_failures_threshold": 2,
             "auto_pause_on_failure": True,
             "cancel_on_critical_failure": False,
@@ -332,7 +332,7 @@ class PrintGuardPlugin(
             vision_client=vision_client,
             escalation_threshold=float(self._get_setting("escalation_threshold", 0.35)),
             vision_ai_periodic_interval=int(
-                self._get_setting("vision_ai_periodic_interval", 5)
+                self._get_setting("vision_ai_periodic_interval", 1)
             ),
             warning_threshold=warning_th,
             failure_threshold=failure_th,
