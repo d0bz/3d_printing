@@ -949,7 +949,7 @@ class PrintGuardPlugin(
 
         if command == "set_interval":
             try:
-                interval = max(2, min(600, int(data.get("interval", 10))))
+                interval = max(2, min(3600, int(data.get("interval", 10))))
             except (TypeError, ValueError):
                 interval = 10
             if self._settings is not None:

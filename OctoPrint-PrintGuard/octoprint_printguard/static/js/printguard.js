@@ -24,7 +24,11 @@ $(function () {
             { val: 30, label: "30 sec" },
             { val: 60, label: "1 min" },
             { val: 120, label: "2 min" },
-            { val: 300, label: "5 min" }
+            { val: 300, label: "5 min" },
+            { val: 600, label: "10 min" },
+            { val: 1200, label: "20 min" },
+            { val: 2400, label: "40 min" },
+            { val: 3600, label: "1 hour" }
         ]);
         self.consecutiveFailures = ko.observable(0);
         self.consecutiveThreshold = ko.observable(2);
@@ -210,7 +214,7 @@ $(function () {
                 var iv = parseInt(data.check_interval_seconds, 10);
                 var exists = self.intervalOptions().some(function (o) { return o.val === iv; });
                 if (!exists) {
-                    self.intervalOptions.push({ val: iv, label: iv + " sec" });
+                    self.intervalOptions.push({ val: iv, label: iv >= 60 && iv % 60 === 0 ? (iv / 60) + " min" : iv + " sec" });
                 }
                 self.checkInterval(iv);
             }
