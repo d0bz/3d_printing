@@ -1,6 +1,7 @@
 # coding=utf-8
 from __future__ import annotations
 
+import copy
 import io
 import logging
 import math
@@ -113,6 +114,7 @@ class LocalCVDetector:
         self._base_centroid_x: Optional[float] = None
         self._base_bottom_y: Optional[float] = None
         self._stagnant_z_steps: int = 0
+        self._stagnant_counted_z: Optional[float] = None
 
         if self.onnx_model_path and HAS_ONNX and os.path.isfile(self.onnx_model_path):
             try:
@@ -133,6 +135,7 @@ class LocalCVDetector:
         self._base_centroid_x = None
         self._base_bottom_y = None
         self._stagnant_z_steps = 0
+        self._stagnant_counted_z = None
 
     def analyze(
         self,
@@ -509,7 +512,13 @@ class LocalCVDetector:
 
                 # If Z increased by >= 0.8mm but neither the part top grew nor the upper layer band changed
                 if top_growth < 0.008 and band_diff < 4.5:
-                    self._stagnant_z_steps += 1
+                    # Count one stagnant step per +0.8mm of Z progress (not per call) so fast ticks can't inflate it
+                    if (
+                        self._stagnant_counted_z is None
+                        or cur_z - self._stagnant_counted_z >= 0.8
+                    ):
+                        self._stagnant_z_steps += 1
+                        self._stagnant_counted_z = cur_z
                     stagnant_factor = min(1.0, (delta_z / 2.0) * (0.55 + 0.25 * self._stagnant_z_steps))
                     score = max(0.55, stagnant_factor)
                     note = (
@@ -519,6 +528,7 @@ class LocalCVDetector:
                 else:
                     # Print is actively growing; advance reference snapshot
                     self._stagnant_z_steps = 0
+                    self._stagnant_counted_z = None
                     self._reference_frame = gray.copy()
                     self._reference_z = cur_z
                     self._reference_top_y = current_top_y
@@ -608,6 +618,8 @@ class HybridDetector:
         self._check_counter: int = 0
         self._reference_jpeg: Optional[bytes] = None
         self._reference_z: Optional[float] = None
+        self.last_local_result: Optional[DetectionResult] = None
+        self.last_vision_ok: bool = False
 
     def reset_state(self) -> None:
         self._check_counter = 0
@@ -635,7 +647,9 @@ class HybridDetector:
             context.previous_z = self._reference_z
 
         # Always run local CV first (very fast, updates frame tracking state)
+        self.last_vision_ok = False
         local_result = self.local_detector.analyze(current_jpeg, context=context)
+        self.last_local_result = copy.copy(local_result)
 
         if self.mode == "local_only":
             self._update_reference_jpeg(current_jpeg, context, local_result)
@@ -650,6 +664,7 @@ class HybridDetector:
                         context=context,
                         local_hint=local_result,
                     )
+                    self.last_vision_ok = True
                     self._update_reference_jpeg(current_jpeg, context, ai_res)
                     return ai_res
                 except Exception as exc:
@@ -680,6 +695,7 @@ class HybridDetector:
                         local_hint=local_result,
                     )
                     merged = self._merge_results(local_result, ai_res)
+                    self.last_vision_ok = True
                     self._update_reference_jpeg(current_jpeg, context, merged)
                     return merged
                 except Exception as exc:

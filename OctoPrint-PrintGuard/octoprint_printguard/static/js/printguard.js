@@ -38,6 +38,14 @@ $(function () {
         self.overallConfidence = ko.observable(0.0);
         self.lastExplanation = ko.observable("Waiting for camera inspection...");
         self.expectedModelSummary = ko.observable("");
+        self.localCvEnabled = ko.observable(true);
+        self.localCvInterval = ko.observable(30);
+        self.falseAlarmCount = ko.observable(0);
+        self.falseAlarmLimit = ko.observable(5);
+        self.gateOpen = ko.observable(true);
+        self.gateHidden = ko.observable(null);
+        self.gateNozzle = ko.observable(null);
+        self.cvTicks = ko.observableArray([]);
         self.scoreNoExtrusion = ko.observable(0.0);
         self.scoreBedDetachment = ko.observable(0.0);
         self.scoreSpaghetti = ko.observable(0.0);
@@ -136,6 +144,47 @@ $(function () {
             return self.selectedHistoryImageUrl() || self.activeFeedUrl();
         });
 
+        self.localCvStatusText = ko.pureComputed(function () {
+            if (!self.localCvEnabled()) {
+                return "Local CV is OFF: only Vision AI checks run at the normal interval.";
+            }
+            var parts = ["Local CV every " + self.localCvInterval() + " s"];
+            var ticks = self.cvTicks();
+            if (ticks.length) {
+                parts.push("last score " + Math.round(ticks[ticks.length - 1].score * 100) + "%");
+            }
+            if (self.falseAlarmLimit() > 0) {
+                parts.push("false alarms " + self.falseAlarmCount() + "/" + self.falseAlarmLimit());
+            }
+            return parts.join(" | ");
+        });
+
+        self.captureGateText = ko.pureComputed(function () {
+            var h = self.gateHidden();
+            if (h === null || h === undefined) {
+                return "";
+            }
+            return "Toolhead hides " + Math.round(h * 100) + "% of the layer: " +
+                (self.gateOpen() ? "good moment to capture" : "waiting for a clearer view");
+        });
+
+        self.toggleLocalCv = function () {
+            var target = !self.localCvEnabled();
+            OctoPrint.simpleApiCommand("printguard", "set_local_cv", { enabled: target })
+                .done(function (response) {
+                    if (response && response.state) {
+                        self.applyState(response.state);
+                    }
+                    if (typeof PNotify !== "undefined") {
+                        new PNotify({
+                            title: "PrintGuard Local CV",
+                            text: "Local CV is now " + (target ? "ON" : "OFF"),
+                            type: "info"
+                        });
+                    }
+                });
+        };
+
         self.formattedZ = ko.pureComputed(function () {
             var z = self.currentZ();
             return (z !== null && z !== undefined) ? z.toFixed(2) + " mm" : "N/A";
@@ -223,6 +272,18 @@ $(function () {
             var prevZ = self.currentZ();
             self.currentZ(data.current_z);
             self.detectionMode(data.detection_mode || "hybrid");
+            if (data.local_cv_enabled !== undefined) {
+                self.localCvEnabled(!!data.local_cv_enabled);
+                self.localCvInterval(data.local_cv_interval_seconds || 30);
+                self.falseAlarmCount(data.cv_false_alarm_count || 0);
+                self.falseAlarmLimit(data.cv_false_alarm_limit || 0);
+                self.cvTicks(data.cv_ticks || []);
+            }
+            if (data.capture_gate) {
+                self.gateOpen(!!data.capture_gate.open);
+                self.gateHidden(data.capture_gate.hidden === undefined ? null : data.capture_gate.hidden);
+                self.gateNozzle(data.capture_gate.nozzle || null);
+            }
             if (data.expected_model_summary !== undefined) {
                 self.expectedModelSummary(data.expected_model_summary || "");
             }

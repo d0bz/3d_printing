@@ -70,6 +70,7 @@ from .models import (
     SubScores,
 )
 from .notifier import NotificationManager
+from .smart_capture import NozzleTracker, capture_window
 from .vision_providers import VisionAIClient
 
 
@@ -105,6 +106,17 @@ class PrintGuardPlugin(
         self._z_change_count: int = 0
         self._consecutive_failures: int = 0
         self._in_fast_recheck: bool = False
+        self._analysis_lock = threading.RLock()
+        self._expected_lock = threading.Lock()
+        self._nozzle_tracker = NozzleTracker()
+        self._gate_layer_points: List[Any] = []
+        self._gate_state: Dict[str, Any] = {"open": True, "hidden": None, "reason": "idle"}
+        self._last_capture: Dict[str, Any] = {}
+        self._cv_ticks: Deque[Dict[str, Any]] = deque(maxlen=60)
+        self._local_cv_streak: int = 0
+        self._clean_tick_streak: int = 0
+        self._false_alarm_count: int = 0
+        self._escalation_block_until: float = 0.0
         self._last_result: Optional[DetectionResult] = None
         self._latest_raw_jpeg: Optional[bytes] = None
         self._latest_annotated_jpeg: Optional[bytes] = None
@@ -193,6 +205,21 @@ class PrintGuardPlugin(
             "check_interval_seconds": 10,
             "failure_recheck_seconds": 30,
             "failure_recheck_threshold": 2,
+            # Fast Local CV ticks, escalation and false-alarm handling
+            "local_cv_enabled": True,
+            "local_cv_interval_seconds": 30,
+            "local_cv_escalate_consecutive": 2,
+            "cv_false_alarm_limit": 5,
+            "escalation_backoff_seconds": 60,
+            "cv_false_alarm_reset_ticks": 10,
+            # Smart capture: only photograph when the toolhead does not hide the layer being printed
+            "smart_capture_enabled": True,
+            "camera_x_mm": 50.0,
+            "camera_y_mm": 0.0,
+            "camera_height_mm": 50.0,
+            "toolhead_width_mm": 60.0,
+            "max_occluded_fraction": 0.15,
+            "smart_capture_max_wait_seconds": 90,
             "initial_grace_seconds": 45,
             "detection_mode": "hybrid",  # "hybrid", "local_only", "vision_ai_only"
             "sensitivity": 1.0,
@@ -290,8 +317,14 @@ class PrintGuardPlugin(
             model=raw_model,
             api_base_url=str(self._get_setting("vision_api_base_url", "")),
         )
+        configured_mode = str(self._get_setting("detection_mode", "hybrid"))
+        if not bool(self._get_setting("local_cv_enabled", True)) and configured_mode in (
+            "hybrid",
+            "local_only",
+        ):
+            configured_mode = "vision_ai_only"  # Local CV switched off manually: Vision AI decides alone
         self._detector = HybridDetector(
-            mode=str(self._get_setting("detection_mode", "hybrid")),
+            mode=configured_mode,
             local_detector=local_detector,
             vision_client=vision_client,
             escalation_threshold=float(self._get_setting("escalation_threshold", 0.35)),
@@ -368,8 +401,20 @@ class PrintGuardPlugin(
             or str(self._get_setting("phone_snapshot_url", "")).strip()
         )
 
-    def _fetch_single_source_snapshot(self, source: str) -> bytes:
-        """Fetch a snapshot for a single camera source; for 'phone', trigger autofocus capture and support phone push."""
+    def _fetch_single_source_snapshot(self, source: str, cheap: bool = False) -> bytes:
+        """Fetch a snapshot for a single camera source; for 'phone', trigger autofocus capture and support phone push.
+
+        With cheap=True (fast Local CV ticks) the phone's plain snapshot endpoint is used instead of the
+        slower autofocus capture.
+        """
+        if source == "phone" and cheap:
+            cached = self._live_frame_cache.get("phone")
+            if cached and (time.time() - cached[0]) < 0.6:
+                return cached[1]
+            r = requests.get(self._resolve_snapshot_url("phone"), timeout=4.0)
+            r.raise_for_status()
+            self._live_frame_cache["phone"] = (time.time(), r.content)
+            return r.content
         if source == "phone":
             self._phone_capture_requested = True
             self._phone_capture_event.clear()
@@ -417,7 +462,7 @@ class PrintGuardPlugin(
         r.raise_for_status()
         return r.content
 
-    def fetch_snapshot(self) -> bytes:
+    def fetch_snapshot(self, cheap: bool = False) -> bytes:
         """Fetch raw JPEG snapshot bytes from the selected camera(s) and stitch if multi-camera is selected."""
         choice = str(self._get_setting("active_camera", "camera1")).strip()
         if choice in ("both", "all", "cam1_phone", "cam2_phone"):
@@ -436,7 +481,7 @@ class PrintGuardPlugin(
             last_err: Optional[Exception] = None
             for src in sources:
                 try:
-                    frames.append(self._fetch_single_source_snapshot(src))
+                    frames.append(self._fetch_single_source_snapshot(src, cheap=cheap))
                 except Exception as exc:
                     last_err = exc
                     self._logger.debug("Multi-cam source '%s' unavailable: %s", src, exc)
@@ -449,7 +494,7 @@ class PrintGuardPlugin(
                 return frames[0]
             return self._stitch_snapshots(*frames)
 
-        return self._fetch_single_source_snapshot(choice)
+        return self._fetch_single_source_snapshot(choice, cheap=cheap)
 
     @staticmethod
     def _stitch_snapshots(*jpegs: bytes) -> bytes:
@@ -531,20 +576,28 @@ class PrintGuardPlugin(
         expected_jpeg: Optional[bytes] = None
         effective_z = self._current_z
         try:
-            expected_state = self._gcode_analyzer.get_expected_state(
-                filepath or filename,
-                current_z=self._current_z,
-                progress_completion=progress,
-                is_printing=is_printing,
-            )
+            # Serialised so a slow older caller (e.g. the start-of-print preload) can never overwrite
+            # the summary/layer points of a newer Z with stale values: Z is read inside the lock.
+            with self._expected_lock:
+                effective_z = self._current_z
+                expected_state = self._gcode_analyzer.get_expected_state(
+                    filepath or filename,
+                    current_z=effective_z,
+                    progress_completion=progress,
+                    is_printing=is_printing,
+                )
+                if expected_state is not None:
+                    self._latest_expected_model_summary = expected_state.summary_text
+                    self._latest_expected_model_jpeg = expected_state.reference_jpeg
+                    self._gate_layer_points = list(expected_state.layer_points)
+                    # Seed Z from the print progress only while no real Z is known yet; never overwrite a
+                    # newer Z (set by ZChange) with a stale value computed while the G-code was parsing.
+                    if is_printing and (self._current_z is None or self._current_z <= 0.0):
+                        self._current_z = expected_state.current_z
+                    effective_z = self._current_z
             if expected_state is not None:
                 expected_summary = expected_state.summary_text
                 expected_jpeg = expected_state.reference_jpeg
-                self._latest_expected_model_summary = expected_summary
-                self._latest_expected_model_jpeg = expected_jpeg
-                if is_printing and (effective_z is None or effective_z <= 0.0):
-                    effective_z = expected_state.current_z
-                    self._current_z = effective_z
                 if not filename:
                     filename = expected_state.filename
         except Exception as exc:
@@ -579,6 +632,12 @@ class PrintGuardPlugin(
             self._previous_z = None
             self._z_change_count = 0
             self._consecutive_failures = 0
+            self._false_alarm_count = 0
+            self._local_cv_streak = 0
+            self._clean_tick_streak = 0
+            self._escalation_block_until = 0.0
+            self._cv_ticks.clear()
+            self._nozzle_tracker.reset()
             if self._detector is None:
                 self._rebuild_components()
             if self._detector is not None:
@@ -602,6 +661,9 @@ class PrintGuardPlugin(
 
         elif event == "PrintResumed":
             self._consecutive_failures = 0
+            self._false_alarm_count = 0
+            self._local_cv_streak = 0
+            self._escalation_block_until = 0.0
             self._in_fast_recheck = False
             if bool(self._get_setting("enabled", True)):
                 self.start_monitoring()
@@ -668,28 +730,249 @@ class PrintGuardPlugin(
             self._stop_event.set()
         self._send_ui_update()
 
+    def on_gcode_sent(
+        self,
+        comm_instance: Any,
+        phase: Any,
+        cmd: Any,
+        cmd_type: Any,
+        gcode: Any,
+        *args: Any,
+        **kwargs: Any
+    ) -> None:
+        """`octoprint.comm.protocol.gcode.sent` hook: keep track of the commanded nozzle X/Y."""
+        try:
+            self._nozzle_tracker.on_sent(cmd if isinstance(cmd, str) else None)
+        except Exception:
+            pass
+        return None
+
+    def _is_printing(self) -> bool:
+        try:
+            return bool(self._printer is not None and self._printer.is_printing())
+        except Exception:
+            return False
+
+    def _local_cv_active(self) -> bool:
+        """Fast Local CV ticks run only in hybrid mode while Local CV is switched on."""
+        return (
+            bool(self._get_setting("local_cv_enabled", True))
+            and str(self._get_setting("detection_mode", "hybrid")) == "hybrid"
+            and int(self._get_setting("local_cv_interval_seconds", 30) or 0) > 0
+        )
+
+    def _smart_gate(self) -> Dict[str, Any]:
+        """Is the camera view of the layer being printed free of the toolhead's shadow right now?"""
+        if not bool(self._get_setting("smart_capture_enabled", True)) or not self._is_printing():
+            return {"open": True, "hidden": None, "reason": "bypass"}
+        nozzle = self._nozzle_tracker.position(max_age=20.0)
+        gate = capture_window(
+            (
+                float(self._get_setting("camera_x_mm", 50.0)),
+                float(self._get_setting("camera_y_mm", 0.0)),
+            ),
+            nozzle,
+            self._gate_layer_points,
+            float(self._get_setting("toolhead_width_mm", 60.0)),
+            float(self._get_setting("max_occluded_fraction", 0.15)),
+        )
+        gate["nozzle"] = list(nozzle) if nozzle else None
+        return gate
+
+    def _post_hybrid_wait(self, res: DetectionResult) -> float:
+        """Seconds until the next scheduled Hybrid check (30 s verification re-check after an anomaly)."""
+        normal_interval = max(2, int(self._get_setting("check_interval_seconds", 10)))
+        if res.is_failure or res.is_warning:
+            recheck_sec = max(5, int(self._get_setting("failure_recheck_seconds", 30)))
+            self._in_fast_recheck = True
+            self._logger.info(
+                "Anomaly detected (status=%s, conf=%.2f) — scheduling fast verification re-check in %ds",
+                res.status.value,
+                res.confidence,
+                min(normal_interval, recheck_sec),
+            )
+            return float(min(normal_interval, recheck_sec))
+        self._in_fast_recheck = False
+        return float(normal_interval)
+
     def _monitoring_loop(self) -> None:
+        now = time.time()
+        next_hybrid = now
+        next_local = now + max(5, int(self._get_setting("local_cv_interval_seconds", 30) or 30))
+        arm_since: Optional[float] = None
+
         while not self._stop_event.is_set():
-            normal_interval = max(2, int(self._get_setting("check_interval_seconds", 10)))
-            wait_sec = normal_interval
+            now = time.time()
+            local_on = self._local_cv_active() and bool(self._get_setting("enabled", True))
+            local_iv = max(5, int(self._get_setting("local_cv_interval_seconds", 30) or 30))
+            due_h = next_hybrid
+            due_l = next_local if local_on else float("inf")
+            due = min(due_h, due_l)
+            if now < due:
+                self._stop_event.wait(min(due - now, 1.0))
+                continue
+            kind = "hybrid" if due_h <= due_l else "local"
+
+            # Smart capture: wait (up to a limit) for the toolhead to leave the camera's line of sight
+            gate = self._smart_gate()
+            self._gate_state = gate
+            max_wait = max(0, int(self._get_setting("smart_capture_max_wait_seconds", 90)))
+            if not gate.get("open"):
+                if arm_since is None:
+                    arm_since = now
+                if (now - arm_since) < max_wait:
+                    self._stop_event.wait(0.5)
+                    continue
+            waited = (now - arm_since) if arm_since is not None else 0.0
+            self._last_capture = {
+                "ts": now,
+                "kind": kind,
+                "waited_s": round(waited, 1),
+                "hidden": gate.get("hidden"),
+                "reason": gate.get("reason") if gate.get("open") else "max-wait",
+            }
+            arm_since = None
+
             try:
-                if bool(self._get_setting("enabled", True)):
+                if not bool(self._get_setting("enabled", True)):
+                    next_hybrid = time.time() + 5
+                    continue
+                if kind == "hybrid":
                     res = self.run_single_check(force_vision_ai=self._in_fast_recheck)
-                    if res.is_failure or res.is_warning:
-                        recheck_sec = max(5, int(self._get_setting("failure_recheck_seconds", 30)))
-                        wait_sec = min(normal_interval, recheck_sec)
-                        self._in_fast_recheck = True
+                    next_hybrid = time.time() + self._post_hybrid_wait(res)
+                    next_local = time.time() + local_iv
+                else:
+                    escalate = self._run_local_tick()
+                    next_local = time.time() + local_iv
+                    if escalate:
                         self._logger.info(
-                            "Anomaly detected (status=%s, conf=%.2f) — scheduling fast verification re-check in %ds",
-                            res.status.value,
-                            res.confidence,
-                            wait_sec,
+                            "Local CV anomaly on %d consecutive ticks — escalating to Hybrid check",
+                            int(self._get_setting("local_cv_escalate_consecutive", 2)),
                         )
-                    else:
-                        self._in_fast_recheck = False
+                        res = self.run_single_check(force_vision_ai=True)
+                        next_hybrid = time.time() + self._post_hybrid_wait(res)
+                        next_local = time.time() + local_iv
             except Exception as exc:
                 self._logger.warning("Monitoring check error: %s", exc)
-            self._stop_event.wait(wait_sec)
+                if kind == "hybrid":
+                    next_hybrid = time.time() + max(
+                        2, int(self._get_setting("check_interval_seconds", 10))
+                    )
+                else:
+                    next_local = time.time() + local_iv
+
+    def _run_local_tick(self) -> bool:
+        """Cheap Local-CV-only check. Returns True when the anomaly streak calls for a Hybrid escalation."""
+        if self._detector is None:
+            self._rebuild_components()
+        if not self._is_printing():
+            return False
+        with self._analysis_lock:
+            raw = self.fetch_snapshot(cheap=True)
+            context = self._build_printer_context()
+            res = self._detector.local_detector.analyze(raw, context=context)  # type: ignore[union-attr]
+        esc_th = float(self._get_setting("escalation_threshold", 0.35))
+        anomalous = res.confidence >= esc_th
+        self._cv_ticks.append(
+            {
+                "ts": time.time(),
+                "score": round(float(res.confidence), 3),
+                "status": res.status.value,
+                "z": context.current_z,
+                "hidden": self._gate_state.get("hidden"),
+            }
+        )
+        if anomalous:
+            self._local_cv_streak += 1
+            self._clean_tick_streak = 0
+        else:
+            self._local_cv_streak = 0
+            self._clean_tick_streak += 1
+            if self._clean_tick_streak >= int(self._get_setting("cv_false_alarm_reset_ticks", 10)):
+                self._false_alarm_count = 0
+        self._send_ui_update()
+        need = max(1, int(self._get_setting("local_cv_escalate_consecutive", 2)))
+        if self._local_cv_streak >= need and time.time() >= self._escalation_block_until:
+            self._local_cv_streak = 0
+            return True
+        return False
+
+    def _register_cv_outcome(self, result: DetectionResult) -> bool:
+        """Count Local CV false alarms (Local CV >= threshold, Vision AI answered OK). True = limit reached."""
+        det = self._detector
+        local = getattr(det, "last_local_result", None)
+        if (
+            local is None
+            or not getattr(det, "last_vision_ok", False)
+            or str(self._get_setting("detection_mode", "hybrid")) != "hybrid"
+            or not bool(self._get_setting("local_cv_enabled", True))
+        ):
+            return False
+        if float(local.confidence) < float(self._get_setting("escalation_threshold", 0.35)):
+            return False
+        if result.status == DetectionStatus.OK:
+            self._false_alarm_count += 1
+            self._local_cv_streak = 0
+            self._escalation_block_until = time.time() + max(
+                0, int(self._get_setting("escalation_backoff_seconds", 60))
+            )
+            limit = int(self._get_setting("cv_false_alarm_limit", 5) or 0)
+            return limit > 0 and self._false_alarm_count >= limit
+        self._false_alarm_count = 0
+        return False
+
+    def _pause_for_cv_disagreement(self, context: PrinterContext, result: DetectionResult) -> None:
+        """Local CV raised N false alarms that Vision AI dismissed: pause for a human look and alert."""
+        n = self._false_alarm_count
+        local = getattr(self._detector, "last_local_result", None)
+        esc_th = float(self._get_setting("escalation_threshold", 0.35))
+        grace_sec = max(0, int(self._get_setting("initial_grace_seconds", 45)))
+        if (
+            context.is_printing
+            and self._print_start_time is not None
+            and context.print_time_elapsed < grace_sec
+        ):
+            self._false_alarm_count = 0
+            return
+        message = (
+            f"Local CV flagged this print {n} times (score >= {esc_th:.2f}) but Vision AI said everything "
+            "is OK each time. The print was paused for a manual look. Resume if it looks fine; if Local CV "
+            "keeps raising false alarms, switch it off (PrintGuard tab -> Local CV: OFF)."
+        )
+        alert = DetectionResult(
+            status=DetectionStatus.WARNING,
+            confidence=float(local.confidence) if local is not None else 0.5,
+            failure_types=[],
+            sub_scores=local.sub_scores if local is not None else SubScores(),
+            explanation=message,
+            source="cv_disagreement",
+            z_height=context.current_z,
+        )
+        alert.action_taken = self._execute_failure_action(context, allow_cancel=False)
+        if alert.action_taken == "Alert Triggered":
+            alert.action_taken = "Alert only (auto-pause disabled)"
+        else:
+            alert.action_taken = f"{alert.action_taken} — Local CV vs Vision AI disagreement"
+        base_jpeg = self._latest_raw_jpeg or self._latest_annotated_jpeg
+        if base_jpeg:
+            try:
+                self._latest_annotated_jpeg = annotate_snapshot(
+                    base_jpeg,
+                    alert,
+                    expected_model_jpeg=context.expected_model_jpeg,
+                )
+            except Exception:
+                pass
+        try:
+            self._notifier.notify(  # type: ignore[union-attr]
+                result=alert,
+                snapshot_jpeg=self._latest_annotated_jpeg,
+                context=context,
+            )
+        except Exception as exc:
+            self._logger.warning("False-alarm alert notification failed: %s", exc)
+        self._record_history(alert)
+        self._false_alarm_count = 0
 
     def run_single_check(
         self,
@@ -700,6 +983,14 @@ class PrintGuardPlugin(
         if self._detector is None or self._notifier is None:
             self._rebuild_components()
 
+        with self._analysis_lock:
+            return self._run_single_check_locked(snapshot_bytes, force_vision_ai)
+
+    def _run_single_check_locked(
+        self,
+        snapshot_bytes: Optional[bytes],
+        force_vision_ai: bool,
+    ) -> DetectionResult:
         raw_jpeg = snapshot_bytes if snapshot_bytes is not None else self.fetch_snapshot()
         self._latest_raw_jpeg = raw_jpeg
         context = self._build_printer_context()
@@ -709,6 +1000,7 @@ class PrintGuardPlugin(
             context=context,
             force_vision_ai=force_vision_ai or self._in_fast_recheck,
         )
+        cv_limit_reached = self._register_cv_outcome(result)
 
         # Track consecutive failures
         if result.is_failure:
@@ -764,6 +1056,13 @@ class PrintGuardPlugin(
                 context=context,
             )
 
+        self._record_history(result)
+        if cv_limit_reached:
+            self._pause_for_cv_disagreement(context, result)
+        return result
+
+    def _record_history(self, result: DetectionResult) -> None:
+        """Store a result (and its annotated snapshot) in the Recent Inspection Log and push a UI update."""
         self._last_result = result
         snap_id = str(int(result.timestamp * 1000))
         if self._latest_annotated_jpeg:
@@ -780,14 +1079,13 @@ class PrintGuardPlugin(
         entry["snapshot_url"] = f"plugin/printguard/history_snapshot/{snap_id}.jpg"
         self._history.appendleft(entry)
         self._send_ui_update()
-        return result
 
-    def _execute_failure_action(self, context: PrinterContext) -> str:
+    def _execute_failure_action(self, context: PrinterContext, allow_cancel: bool = True) -> str:
         """Pause or cancel the print on OctoPrint when failure threshold is reached."""
         actions_taken: List[str] = []
 
         if self._printer is not None and context.is_printing:
-            if bool(self._get_setting("cancel_on_critical_failure", False)):
+            if allow_cancel and bool(self._get_setting("cancel_on_critical_failure", False)):
                 try:
                     self._printer.cancel_print()
                     actions_taken.append("Print Cancelled")
@@ -903,6 +1201,18 @@ class PrintGuardPlugin(
             ),
             "current_z": self._current_z,
             "detection_mode": str(self._get_setting("detection_mode", "hybrid")),
+            "local_cv_enabled": bool(self._get_setting("local_cv_enabled", True)),
+            "local_cv_interval_seconds": int(self._get_setting("local_cv_interval_seconds", 30) or 0),
+            "cv_false_alarm_count": self._false_alarm_count,
+            "cv_false_alarm_limit": int(self._get_setting("cv_false_alarm_limit", 5) or 0),
+            "cv_ticks": list(self._cv_ticks)[-20:],
+            "capture_gate": {
+                "open": bool(self._gate_state.get("open", True)),
+                "hidden": self._gate_state.get("hidden"),
+                "reason": self._gate_state.get("reason"),
+                "nozzle": self._gate_state.get("nozzle"),
+                "last_capture": self._last_capture,
+            },
             "expected_model_summary": self._latest_expected_model_summary,
             "last_result": self._last_result.to_dict() if self._last_result else None,
             "has_snapshot": self._latest_annotated_jpeg is not None,
@@ -922,6 +1232,7 @@ class PrintGuardPlugin(
             "set_interval": ["interval"],
             "toggle_monitoring": [],
             "toggle_phone_torch": [],
+            "set_local_cv": ["enabled"],
         }
 
     def on_api_get(self, request: Any) -> Any:
@@ -945,6 +1256,21 @@ class PrintGuardPlugin(
                 resp = {"ok": True, "torch": r.json().get("torch", False)}
             except Exception as exc:
                 resp = {"ok": False, "error": str(exc)}
+            return flask.jsonify(resp) if (HAS_OCTOPRINT and flask is not None) else resp
+
+        if command == "set_local_cv":
+            enabled = bool(data.get("enabled"))
+            if self._settings is not None:
+                try:
+                    self._settings.set(["local_cv_enabled"], enabled)
+                    self._settings.save()
+                except Exception as exc:
+                    self._logger.warning("Failed to save local_cv_enabled: %s", exc)
+            self._false_alarm_count = 0
+            self._local_cv_streak = 0
+            self._rebuild_components()
+            self._send_ui_update()
+            resp = {"ok": True, "local_cv_enabled": enabled, "state": self.get_state_payload()}
             return flask.jsonify(resp) if (HAS_OCTOPRINT and flask is not None) else resp
 
         if command == "set_interval":
@@ -1127,17 +1453,39 @@ class PrintGuardPlugin(
         q_file = flask.request.args.get("file") if flask else None
         q_z = flask.request.args.get("z", type=float) if flask else None
         q_pct = flask.request.args.get("pct", type=float) if flask else None
-        if q_file is not None or q_z is not None or q_pct is not None:
-            ctx = self._build_printer_context()
+        show_overlay = (
+            flask.request.args.get("overlay", "1") not in ("0", "false", "no") if flask else True
+        )
+        ctx = self._build_printer_context()
+        overlay: Optional[Dict[str, Any]] = None
+        if show_overlay:
+            nozzle = self._nozzle_tracker.position(max_age=60.0) if ctx.is_printing else None
+            gate = self._smart_gate() if nozzle else {}
+            hidden = gate.get("hidden")
+            overlay = {
+                "camera": (
+                    float(self._get_setting("camera_x_mm", 50.0)),
+                    float(self._get_setting("camera_y_mm", 0.0)),
+                ),
+                "nozzle": nozzle,
+                "toolhead_width": float(self._get_setting("toolhead_width_mm", 60.0)),
+                "label": (
+                    f"nozzle hides {hidden * 100:.0f}% of layer"
+                    + (" - capture OK" if gate.get("open") else " - waiting")
+                    if hidden is not None
+                    else None
+                ),
+            }
+        if q_file is not None or q_z is not None or q_pct is not None or overlay is not None:
             st = self._gcode_analyzer.get_expected_state(
                 q_file or ctx.filepath or ctx.filename,
-                current_z=q_z,
-                progress_completion=q_pct,
+                current_z=q_z if q_z is not None else (self._current_z if q_pct is None else None),
+                progress_completion=q_pct if q_pct is not None else ctx.progress_completion,
                 is_printing=True,
+                overlay=overlay,
             )
             jpeg_bytes = st.reference_jpeg if st is not None else None
         else:
-            ctx = self._build_printer_context()
             jpeg_bytes = ctx.expected_model_jpeg or self._latest_expected_model_jpeg
         if jpeg_bytes is None:
             placeholder = self._generate_test_card(
@@ -1319,4 +1667,6 @@ def __plugin_load__() -> None:
     __plugin_implementation__ = PrintGuardPlugin()
 
     global __plugin_hooks__
-    __plugin_hooks__ = {}
+    __plugin_hooks__ = {
+        "octoprint.comm.protocol.gcode.sent": __plugin_implementation__.on_gcode_sent,
+    }

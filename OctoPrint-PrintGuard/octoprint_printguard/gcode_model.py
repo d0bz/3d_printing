@@ -16,6 +16,34 @@ from PIL import Image, ImageDraw, ImageFont
 logger = logging.getLogger("octoprint.plugins.printguard.gcode_model")
 
 
+def _clip_segment(
+    p0: Tuple[float, float],
+    p1: Tuple[float, float],
+    rect: Tuple[float, float, float, float],
+) -> Optional[Tuple[Tuple[float, float], Tuple[float, float]]]:
+    """Liang-Barsky clip of a line segment to rect=(x0, y0, x1, y1); None if fully outside."""
+    x0, y0 = p0
+    x1, y1 = p1
+    xmin, ymin, xmax, ymax = rect
+    dx, dy = x1 - x0, y1 - y0
+    t0, t1 = 0.0, 1.0
+    for p, q in ((-dx, x0 - xmin), (dx, xmax - x0), (-dy, y0 - ymin), (dy, ymax - y0)):
+        if p == 0:
+            if q < 0:
+                return None
+            continue
+        t = q / p
+        if p < 0:
+            if t > t1:
+                return None
+            t0 = max(t0, t)
+        else:
+            if t < t0:
+                return None
+            t1 = min(t1, t)
+    return (x0 + t0 * dx, y0 + t0 * dy), (x0 + t1 * dx, y0 + t1 * dy)
+
+
 @dataclass
 class LayerSlice:
     """Represents a single horizontal Z layer parsed from a G-code file."""
@@ -122,6 +150,8 @@ class ExpectedModelAtZ:
     reference_jpeg: bytes
     # Per-object state at current Z: [{"name", "label", "status", "layers_done", "layers_total", ...}]
     objects_status: List[Dict[str, Any]] = field(default_factory=list)
+    # Sampled (x, y) points of the layer being printed, used by the smart-capture occlusion gate
+    layer_points: List[Tuple[float, float]] = field(default_factory=list)
 
     @property
     def width_mm(self) -> float:
@@ -153,6 +183,7 @@ class GCodeModelAnalyzer:
         current_z: Optional[float] = None,
         progress_completion: Optional[float] = None,
         is_printing: bool = False,
+        overlay: Optional[Dict[str, Any]] = None,
     ) -> Optional[ExpectedModelAtZ]:
         """Return the expected model state and rendered 3D/2D reference JPEG for the given file & Z."""
         filepath = self._resolve_filepath(filename_or_path)
@@ -195,7 +226,11 @@ class GCodeModelAnalyzer:
 
         # Re-use the previously rendered result while still on the same layer of the same file
         cache_key = (model.filepath, model.mtime, completed_count, round(eff_z, 2))
-        if self._render_cache_key == cache_key and self._render_cache_value is not None:
+        if (
+            overlay is None
+            and self._render_cache_key == cache_key
+            and self._render_cache_value is not None
+        ):
             return self._render_cache_value
 
         fp_xmin = min(ly.x_min for ly in active_layers if ly.x_min < 9000)
@@ -270,7 +305,18 @@ class GCodeModelAnalyzer:
                 f"current top layer cross-section: {active_w:.1f}mm × {active_d:.1f}mm."
             )
 
-        ref_jpeg = self.render_expected_model_jpeg(model, eff_z, active_layers)
+        ref_jpeg = self.render_expected_model_jpeg(model, eff_z, active_layers, overlay=overlay)
+
+        # Sample the outline of the layer being printed (all objects) for the capture-window gate
+        layer_points: List[Tuple[float, float]] = []
+        for segs in top_layer.obj_segments.values():
+            step = max(1, len(segs) // 60)
+            for x0, y0, _x1, _y1, _ in segs[::step]:
+                layer_points.append((x0, y0))
+        if not layer_points:
+            layer_points = [
+                (0.5 * (top_layer.x_min + top_layer.x_max), 0.5 * (top_layer.y_min + top_layer.y_max))
+            ]
 
         state = ExpectedModelAtZ(
             filename=model.filename,
@@ -291,9 +337,11 @@ class GCodeModelAnalyzer:
             summary_text=summary,
             reference_jpeg=ref_jpeg,
             objects_status=objects_status,
+            layer_points=layer_points,
         )
-        self._render_cache_key = cache_key
-        self._render_cache_value = state
+        if overlay is None:
+            self._render_cache_key = cache_key
+            self._render_cache_value = state
         return state
 
     def _resolve_filepath(self, filename_or_path: Optional[str]) -> Optional[str]:
@@ -661,6 +709,7 @@ class GCodeModelAnalyzer:
         current_z: float,
         active_layers: Optional[List[LayerSlice]] = None,
         size: Tuple[int, int] = (640, 480),
+        overlay: Optional[Dict[str, Any]] = None,
     ) -> bytes:
         """
         Render a visual reference image showing what ALL objects on the build plate
@@ -936,15 +985,26 @@ class GCodeModelAnalyzer:
         td_x0, td_y0, td_x1, td_y1 = 355, 265, 625, 440
         draw.rectangle([td_x0, td_y0, td_x1, td_y1], fill=(24, 29, 38), outline=(55, 68, 88))
 
+        # Top-down bounds: the model, plus camera / nozzle when the live overlay is requested
+        tb_x0, tb_x1 = model.x_min, model.x_max
+        tb_y0, tb_y1 = model.y_min, model.y_max
+        if overlay:
+            for key in ("camera", "nozzle"):
+                pt = overlay.get(key)
+                if pt:
+                    tb_x0, tb_x1 = min(tb_x0, pt[0]), max(tb_x1, pt[0])
+                    tb_y0, tb_y1 = min(tb_y0, pt[1]), max(tb_y1, pt[1])
+        tb_cx = 0.5 * (tb_x0 + tb_x1)
+        tb_cy = 0.5 * (tb_y0 + tb_y1)
         td_scale = min(
-            (td_x1 - td_x0 - 24) / max(10.0, span_x),
-            (td_y1 - td_y0 - 36) / max(10.0, span_y),
+            (td_x1 - td_x0 - 24) / max(10.0, tb_x1 - tb_x0),
+            (td_y1 - td_y0 - 36) / max(10.0, tb_y1 - tb_y0),
         )
         td_cx = (td_x0 + td_x1) // 2
         td_cy = (td_y0 + td_y1 - 14) // 2
 
         def to_td(x: float, y: float) -> Tuple[int, int]:
-            return int(td_cx + (x - cx) * td_scale), int(td_cy - (y - cy) * td_scale)
+            return int(td_cx + (x - tb_cx) * td_scale), int(td_cy - (y - tb_cy) * td_scale)
 
         first_layer_of: Dict[str, LayerSlice] = {}
         for ly in model.layers:
@@ -970,6 +1030,42 @@ class GCodeModelAnalyzer:
                     col = (255, 215, 60) if is_current else color_for.get(n, (55, 165, 115))
                     for x0, y0, x1, y1, _ in ly.obj_segments[n]:
                         draw.line([to_td(x0, y0), to_td(x1, y1)], fill=col, width=2 if is_current else 1)
+
+        if overlay:
+            cam = overlay.get("camera")
+            noz = overlay.get("nozzle")
+            tw = float(overlay.get("toolhead_width", 60.0))
+            if cam and noz:
+                from .smart_capture import shadow_wedge
+
+                wedge = shadow_wedge(
+                    (cam[0], cam[1]),
+                    (noz[0], noz[1]),
+                    tw,
+                    max(tb_x1 - tb_x0, tb_y1 - tb_y0) * 1.5,
+                )
+                if wedge:
+                    # Clip the wedge to the panel by drawing only its two rays + chord
+                    p_cam = to_td(*wedge[0])
+                    rect = (td_x0 + 1, td_y0 + 1, td_x1 - 1, td_y1 - 1)
+                    for far_pt in wedge[1:]:
+                        clipped = _clip_segment(p_cam, to_td(*far_pt), rect)
+                        if clipped:
+                            draw.line([clipped[0], clipped[1]], fill=(190, 70, 70), width=1)
+            if cam:
+                cx_p, cy_p = to_td(cam[0], cam[1])
+                draw.polygon(
+                    [(cx_p, cy_p - 6), (cx_p + 6, cy_p), (cx_p, cy_p + 6), (cx_p - 6, cy_p)],
+                    outline=(120, 200, 255),
+                    fill=(40, 90, 140),
+                )
+                draw.text((cx_p + 8, cy_p - 5), "cam", fill=(150, 210, 255), font=font)
+            if noz:
+                nx_p, ny_p = to_td(noz[0], noz[1])
+                draw.ellipse([nx_p - 4, ny_p - 4, nx_p + 4, ny_p + 4], outline=(255, 90, 90), fill=(255, 90, 90))
+                label = overlay.get("label")
+                if label:
+                    draw.text((td_x0 + 8, td_y0 + 4), str(label), fill=(255, 150, 150), font=font)
 
         draw.text(
             (td_x0 + 8, td_y1 - 16),

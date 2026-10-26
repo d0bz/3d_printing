@@ -28,6 +28,10 @@
                 <i class="fa" data-bind="css: {'fa-stop': isMonitoring(), 'fa-play': !isMonitoring()}"></i>
                 <span data-bind="text: isMonitoring() ? 'Auto-Check: ON' : 'Auto-Check: OFF'"></span>
             </button>
+            <button class="btn" data-bind="click: toggleLocalCv, css: {'btn-success': localCvEnabled(), 'btn-warning': !localCvEnabled()}" title="Switch the fast Local CV checks on or off (Vision AI keeps running)">
+                <i class="fa fa-eye"></i>
+                <span data-bind="text: localCvEnabled() ? 'Local CV: ON' : 'Local CV: OFF'"></span>
+            </button>
             <button class="btn btn-primary" data-bind="click: runManualCheck, disable: isChecking">
                 <i class="fa fa-camera" data-bind="css: {'fa-spin fa-spinner': isChecking, 'fa-camera': !isChecking()}"></i>
                 <span data-bind="text: isChecking() ? 'Analyzing...' : 'Check Now'"></span>
@@ -77,6 +81,8 @@
                     <img class="printguard-snapshot-img" style="cursor: zoom-in;" title="Click to enlarge" data-bind="attr: { src: activeFeedUrl }, click: toggleEnlarge, event: { load: onLiveFrameDone, error: onLiveFrameDone }" alt="PrintGuard Camera Feed" />
                 </div>
                 <div class="printguard-explanation" data-bind="text: lastExplanation"></div>
+                <div class="muted" style="font-size: 12px; margin-top: 4px;" data-bind="text: localCvStatusText"></div>
+                <div class="muted" style="font-size: 12px;" data-bind="visible: captureGateText, text: captureGateText"></div>
                 <div class="muted" style="font-size: 11px; margin-top: 4px;" data-bind="visible: expectedModelSummary, text: expectedModelSummary"></div>
             </div>
         </div>

@@ -82,6 +82,91 @@
         </div>
     </div>
 
+    <hr>
+    <h4>1b. Fast Local CV &amp; Smart Capture</h4>
+
+    <div class="control-group">
+        <label class="control-label">Local CV Checks</label>
+        <div class="controls">
+            <label class="checkbox">
+                <input type="checkbox" data-bind="checked: settings.plugins.printguard.local_cv_enabled">
+                Enable fast Local CV checks (switch off if Local CV keeps raising false alarms; Vision AI keeps running)
+            </label>
+        </div>
+    </div>
+
+    <div class="control-group">
+        <label class="control-label">Local CV Interval (seconds)</label>
+        <div class="controls">
+            <input type="number" class="input-small" min="0" max="600"
+                   data-bind="value: settings.plugins.printguard.local_cv_interval_seconds">
+            <span class="help-block">Cheap network-free check between the slower Hybrid checks (default <code>30</code>s, <code>0</code> = off). Two anomalous checks in a row trigger an immediate Hybrid check with Vision AI.</span>
+        </div>
+    </div>
+
+    <div class="control-group">
+        <label class="control-label">Escalate After N Anomalies</label>
+        <div class="controls">
+            <input type="number" class="input-small" min="1" max="10"
+                   data-bind="value: settings.plugins.printguard.local_cv_escalate_consecutive">
+        </div>
+    </div>
+
+    <div class="control-group">
+        <label class="control-label">Pause After N False Alarms</label>
+        <div class="controls">
+            <input type="number" class="input-small" min="0" max="50"
+                   data-bind="value: settings.plugins.printguard.cv_false_alarm_limit">
+            <span class="help-block">When Local CV raises an alarm and Vision AI says everything is OK this many times (default <code>5</code>), the print is paused and an alert is sent so you can take a look. <code>0</code> disables this.</span>
+        </div>
+    </div>
+
+    <div class="control-group">
+        <label class="control-label">Back-off After Dismissed Alarm (seconds)</label>
+        <div class="controls">
+            <input type="number" class="input-small" min="0" max="3600"
+                   data-bind="value: settings.plugins.printguard.escalation_backoff_seconds">
+        </div>
+    </div>
+
+    <div class="control-group">
+        <label class="control-label">Smart Capture</label>
+        <div class="controls">
+            <label class="checkbox">
+                <input type="checkbox" data-bind="checked: settings.plugins.printguard.smart_capture_enabled">
+                Take photos when the toolhead does not hide the layer being printed
+            </label>
+            <span class="help-block">Camera position on the plate (mm), height, and toolhead width are used to work out what the toolhead hides from the camera.</span>
+        </div>
+    </div>
+
+    <div class="control-group">
+        <label class="control-label">Camera X / Y / Height (mm)</label>
+        <div class="controls">
+            <input type="number" step="1" class="input-mini" data-bind="value: settings.plugins.printguard.camera_x_mm">
+            <input type="number" step="1" class="input-mini" data-bind="value: settings.plugins.printguard.camera_y_mm">
+            <input type="number" step="1" class="input-mini" data-bind="value: settings.plugins.printguard.camera_height_mm">
+        </div>
+    </div>
+
+    <div class="control-group">
+        <label class="control-label">Toolhead Width (mm) / Max Hidden</label>
+        <div class="controls">
+            <input type="number" step="1" min="10" class="input-mini" data-bind="value: settings.plugins.printguard.toolhead_width_mm">
+            <input type="number" step="0.05" min="0" max="1" class="input-mini" data-bind="value: settings.plugins.printguard.max_occluded_fraction">
+            <span class="help-block">Capture is allowed when the toolhead hides at most this fraction of the layer (default <code>0.15</code>).</span>
+        </div>
+    </div>
+
+    <div class="control-group">
+        <label class="control-label">Max Wait For Clear View (seconds)</label>
+        <div class="controls">
+            <input type="number" class="input-small" min="0" max="600"
+                   data-bind="value: settings.plugins.printguard.smart_capture_max_wait_seconds">
+            <span class="help-block">After this wait, the photo is taken anyway (default <code>90</code>s).</span>
+        </div>
+    </div>
+
     <div class="control-group">
         <label class="control-label">Vision AI Check Every N Checks</label>
         <div class="controls">

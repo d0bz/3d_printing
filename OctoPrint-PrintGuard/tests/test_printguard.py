@@ -498,3 +498,210 @@ def test_gcode_model_analyzer_tracks_multiple_objects_on_plate(tmp_path):
 
     with Image.open(io.BytesIO(state.reference_jpeg)) as ref_img:
         assert ref_img.size == (640, 480)
+
+
+# ---------------------------------------------------------------------------
+# Smart capture, fast Local CV ticks, false-alarm pause, Local CV switch
+# ---------------------------------------------------------------------------
+from octoprint_printguard.smart_capture import (  # noqa: E402
+    NozzleTracker,
+    capture_window,
+    hidden_fraction,
+)
+
+
+class _FakeSettings:
+    def __init__(self, values=None):
+        self.values = dict(values or {})
+
+    def get(self, path):
+        return self.values.get(path[0])
+
+    def set(self, path, value):
+        self.values[path[0]] = value
+
+    def save(self):
+        pass
+
+    def global_get(self, path):
+        return None
+
+
+def test_nozzle_tracker_parses_absolute_relative_and_homing():
+    t = NozzleTracker()
+    assert t.position() is None
+    t.on_sent("G28")
+    assert t.position() == (0.0, 0.0)
+    t.on_sent("N12 G1 X120.5 Y80.25 E1.2 F1800*45")
+    assert t.position() == (120.5, 80.25)
+    t.on_sent("G1 Z0.4")  # no X/Y: unchanged
+    assert t.position() == (120.5, 80.25)
+    t.on_sent("G91")
+    t.on_sent("G1 X-10 Y5")
+    assert t.position() == (110.5, 85.25)
+    t.on_sent("G90")
+    t.on_sent("G92 X0 Y0")
+    assert t.position() == (0.0, 0.0)
+    t.on_sent("M104 S200")  # ignored
+    assert t.position() == (0.0, 0.0)
+
+
+def test_hidden_fraction_camera_at_low_corner():
+    camera = (50.0, 0.0)
+    # Layer outline: a ring of points around (150, 150), radius 20mm
+    import math as _m
+
+    pts = [(150 + 20 * _m.cos(a / 10.0), 150 + 20 * _m.sin(a / 10.0)) for a in range(63)]
+    # Nozzle far behind the part (farther from the camera than every point): nothing hidden
+    assert hidden_fraction(camera, (260.0, 260.0), pts, 60.0) == pytest.approx(0.0)
+    # Nozzle right in front of the part on the line camera -> part: hides a large share
+    front = hidden_fraction(camera, (110.0, 110.0), pts, 60.0)
+    assert front > 0.5
+    # Nozzle far off to the side of the line of sight: nothing hidden
+    assert hidden_fraction(camera, (280.0, 40.0), pts, 60.0) == pytest.approx(0.0)
+    # Gate: open when little is hidden, closed when the toolhead shadows the layer
+    assert capture_window(camera, (260.0, 260.0), pts, 60.0, 0.10)["open"] is True
+    assert capture_window(camera, (110.0, 110.0), pts, 60.0, 0.10)["open"] is False
+    # Unknown position never blocks capture
+    assert capture_window(camera, None, pts, 60.0, 0.10)["open"] is True
+
+
+def test_local_cv_stagnation_counts_per_z_progress_not_per_call():
+    detector = LocalCVDetector(warning_threshold=0.45, failure_threshold=0.70)
+    frame = _make_clean_print_jpeg(top_y=150)
+    detector.analyze(frame, PrinterContext(is_printing=True, current_z=4.0))
+    for _ in range(6):  # six fast ticks at the same Z height must count as ONE stagnant step
+        detector.analyze(frame, PrinterContext(is_printing=True, current_z=5.2))
+    assert detector._stagnant_z_steps == 1
+
+
+def test_local_cv_off_switches_detector_to_vision_only():
+    plugin = PrintGuardPlugin()
+    plugin._settings = _FakeSettings({"local_cv_enabled": False, "detection_mode": "hybrid"})
+    plugin._rebuild_components()
+    assert plugin._detector.mode == "vision_ai_only"
+    plugin._settings.set(["local_cv_enabled"], True)
+    plugin._rebuild_components()
+    assert plugin._detector.mode == "hybrid"
+    # Fast ticks only run while Local CV is on
+    plugin._settings.set(["local_cv_enabled"], False)
+    assert plugin._local_cv_active() is False
+
+
+def _make_plugin_with_fake_detector(local_conf: float):
+    plugin = PrintGuardPlugin()
+    plugin._printer = MagicMock()
+    plugin._printer.is_printing.return_value = True
+    plugin._printer.get_current_data.return_value = {
+        "progress": {"completion": 30.0},
+        "job": {"file": {"name": "x.gcode"}},
+    }
+    plugin._printer.get_current_temperatures.return_value = {}
+    plugin._rebuild_components()
+    plugin._print_start_time = 100.0  # grace period long over
+    det = MagicMock()
+    det.mode = "hybrid"
+    det.last_local_result = DetectionResult(
+        status=DetectionStatus.WARNING,
+        confidence=local_conf,
+        sub_scores=SubScores(spaghetti=local_conf),
+    )
+    det.last_vision_ok = True
+    det.analyze.return_value = DetectionResult(
+        status=DetectionStatus.OK, confidence=0.05, explanation="Vision AI: all good", source="hybrid"
+    )
+    plugin._detector = det
+    return plugin
+
+
+def test_five_dismissed_local_cv_alarms_pause_print_and_alert():
+    plugin = _make_plugin_with_fake_detector(local_conf=0.62)
+    plugin._notifier = MagicMock()
+    frame = _make_clean_print_jpeg()
+    for i in range(4):
+        res = plugin.run_single_check(snapshot_bytes=frame)
+        assert res.status == DetectionStatus.OK
+        assert plugin._false_alarm_count == i + 1
+        assert not plugin._printer.pause_print.called
+    plugin.run_single_check(snapshot_bytes=frame)  # 5th dismissed alarm
+    assert plugin._printer.pause_print.called
+    assert plugin._notifier.notify.called
+    alert = plugin._notifier.notify.call_args.kwargs["result"]
+    assert alert.source == "cv_disagreement"
+    assert "5 times" in alert.explanation
+    assert "Local CV: OFF" in alert.explanation
+    assert plugin._false_alarm_count == 0  # reset after the alert
+    assert plugin._history[0]["source"] == "cv_disagreement"
+
+
+def test_confirmed_failure_resets_false_alarm_counter_and_low_scores_do_not_count():
+    plugin = _make_plugin_with_fake_detector(local_conf=0.62)
+    frame = _make_clean_print_jpeg()
+    plugin.run_single_check(snapshot_bytes=frame)
+    plugin.run_single_check(snapshot_bytes=frame)
+    assert plugin._false_alarm_count == 2
+    # Vision AI now confirms a real problem: counter resets (normal failure path takes over)
+    plugin._detector.analyze.return_value = DetectionResult(
+        status=DetectionStatus.WARNING, confidence=0.55, explanation="Vision AI: something off", source="hybrid"
+    )
+    plugin.run_single_check(snapshot_bytes=frame)
+    assert plugin._false_alarm_count == 0
+    # A quiet Local CV score (below the escalation threshold) is not a false alarm
+    plugin._detector.last_local_result.confidence = 0.10
+    plugin._detector.analyze.return_value = DetectionResult(
+        status=DetectionStatus.OK, confidence=0.02, explanation="ok", source="hybrid"
+    )
+    plugin.run_single_check(snapshot_bytes=frame)
+    assert plugin._false_alarm_count == 0
+    # Vision AI unreachable (no answer): never counted
+    plugin._detector.last_local_result.confidence = 0.80
+    plugin._detector.last_vision_ok = False
+    plugin.run_single_check(snapshot_bytes=frame)
+    assert plugin._false_alarm_count == 0
+
+
+def test_fast_local_tick_escalates_after_consecutive_anomalies_with_backoff():
+    plugin = _make_plugin_with_fake_detector(local_conf=0.62)
+    plugin.fetch_snapshot = lambda cheap=False: _make_clean_print_jpeg()  # type: ignore[assignment]
+    plugin._detector.local_detector.analyze.return_value = DetectionResult(
+        status=DetectionStatus.WARNING, confidence=0.60
+    )
+    assert plugin._run_local_tick() is False  # 1st anomalous tick
+    assert plugin._run_local_tick() is True  # 2nd consecutive -> escalate
+    assert len(plugin._cv_ticks) == 2
+    # After a dismissed alarm the back-off blocks immediate re-escalation
+    plugin._escalation_block_until = __import__("time").time() + 60
+    assert plugin._run_local_tick() is False
+    assert plugin._run_local_tick() is False
+    # Clean ticks reset the streak and, after enough of them, the false-alarm counter
+    plugin._false_alarm_count = 3
+    plugin._detector.local_detector.analyze.return_value = DetectionResult(
+        status=DetectionStatus.OK, confidence=0.05
+    )
+    for _ in range(10):
+        plugin._run_local_tick()
+    assert plugin._false_alarm_count == 0
+
+
+def test_smart_gate_waits_for_clear_view_and_bypasses_when_unknown():
+    plugin = PrintGuardPlugin()
+    plugin._printer = MagicMock()
+    plugin._printer.is_printing.return_value = True
+    import math as _m
+
+    plugin._gate_layer_points = [
+        (150 + 20 * _m.cos(a / 10.0), 150 + 20 * _m.sin(a / 10.0)) for a in range(63)
+    ]
+    # No nozzle position yet: capture immediately
+    assert plugin._smart_gate()["open"] is True
+    # Toolhead right in front of the part (camera at 50,0): wait
+    plugin.on_gcode_sent(None, None, "G1 X110 Y110 E1", None, "G1")
+    gate = plugin._smart_gate()
+    assert gate["open"] is False and gate["hidden"] > 0.5
+    # Toolhead on the far side: capture
+    plugin.on_gcode_sent(None, None, "G1 X260 Y260 E2", None, "G1")
+    assert plugin._smart_gate()["open"] is True
+    # Not printing: never gate
+    plugin._printer.is_printing.return_value = False
+    plugin.on_gcode_sent(None, None, "G1 X110 Y110", None, "G1")
+    assert plugin._smart_gate()["open"] is True
