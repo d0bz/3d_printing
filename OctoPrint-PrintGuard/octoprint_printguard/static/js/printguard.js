@@ -46,6 +46,11 @@ $(function () {
         self.gateHidden = ko.observable(null);
         self.gateNozzle = ko.observable(null);
         self.cvTicks = ko.observableArray([]);
+        self.nextLocalAt = ko.observable(null);
+        self.nextHybridAt = ko.observable(null);
+        self.nowMs = ko.observable(Date.now());
+        self.showTicks = ko.observable(true);
+        setInterval(function () { self.nowMs(Date.now()); }, 1000);
         self.scoreNoExtrusion = ko.observable(0.0);
         self.scoreBedDetachment = ko.observable(0.0);
         self.scoreSpaghetti = ko.observable(0.0);
@@ -159,6 +164,30 @@ $(function () {
             return parts.join(" | ");
         });
 
+        self.visibleHistory = ko.pureComputed(function () {
+            var show = self.showTicks();
+            return self.history().filter(function (e) { return show || e.kind !== "tick"; });
+        });
+
+        self.fmtCountdown = function (atMs) {
+            if (atMs === null || atMs === undefined) { return "-"; }
+            var secs = Math.max(0, Math.round((atMs - self.nowMs()) / 1000));
+            if (secs >= 3600) { return Math.floor(secs / 3600) + " h " + Math.floor((secs % 3600) / 60) + " min"; }
+            if (secs >= 120) { return Math.round(secs / 60) + " min"; }
+            return secs + " s";
+        };
+
+        self.nextCheckText = ko.pureComputed(function () {
+            var parts = [];
+            if (self.localCvEnabled() && self.nextLocalAt() !== null) {
+                parts.push("next Local CV capture in " + self.fmtCountdown(self.nextLocalAt()));
+            }
+            if (self.nextHybridAt() !== null) {
+                parts.push("next Hybrid check in " + self.fmtCountdown(self.nextHybridAt()));
+            }
+            return parts.join(" | ");
+        });
+
         self.captureGateText = ko.pureComputed(function () {
             var h = self.gateHidden();
             if (h === null || h === undefined) {
@@ -244,6 +273,20 @@ $(function () {
             return d.toLocaleTimeString();
         };
 
+        self.applyGate = function (data) {
+            if (data.capture_gate) {
+                self.gateOpen(!!data.capture_gate.open);
+                self.gateHidden(data.capture_gate.hidden === undefined ? null : data.capture_gate.hidden);
+                self.gateNozzle(data.capture_gate.nozzle || null);
+            }
+            if (data.next_local_in !== undefined) {
+                self.nextLocalAt(data.next_local_in === null ? null : Date.now() + data.next_local_in * 1000);
+            }
+            if (data.next_hybrid_in !== undefined) {
+                self.nextHybridAt(data.next_hybrid_in === null ? null : Date.now() + data.next_hybrid_in * 1000);
+            }
+        };
+
         self.applyState = function (data) {
             if (!data) return;
             self.isMonitoring(!!data.is_monitoring);
@@ -279,11 +322,7 @@ $(function () {
                 self.falseAlarmLimit(data.cv_false_alarm_limit || 0);
                 self.cvTicks(data.cv_ticks || []);
             }
-            if (data.capture_gate) {
-                self.gateOpen(!!data.capture_gate.open);
-                self.gateHidden(data.capture_gate.hidden === undefined ? null : data.capture_gate.hidden);
-                self.gateNozzle(data.capture_gate.nozzle || null);
-            }
+            self.applyGate(data);
             if (data.expected_model_summary !== undefined) {
                 self.expectedModelSummary(data.expected_model_summary || "");
             }
@@ -411,6 +450,10 @@ $(function () {
 
         self.onDataUpdaterPluginMessage = function (plugin, data) {
             if (plugin !== "printguard") return;
+            if (data && data.type === "gate") {
+                self.applyGate(data);
+                return;
+            }
             var prevStatus = self.lastStatus();
             self.applyState(data);
             if (data.last_result && data.last_result.status === "failure" && prevStatus !== "failure") {

@@ -705,3 +705,46 @@ def test_smart_gate_waits_for_clear_view_and_bypasses_when_unknown():
     plugin._printer.is_printing.return_value = False
     plugin.on_gcode_sent(None, None, "G1 X110 Y110", None, "G1")
     assert plugin._smart_gate()["open"] is True
+
+
+def test_local_tick_is_recorded_in_log_and_updates_live_image():
+    plugin = _make_plugin_with_fake_detector(local_conf=0.10)
+    big = Image.new("RGB", (1280, 720), (60, 70, 80))
+    buf = io.BytesIO()
+    big.save(buf, format="JPEG")
+    frame = buf.getvalue()
+    plugin.fetch_snapshot = lambda cheap=False: frame  # type: ignore[assignment]
+    plugin._detector.local_detector.analyze.return_value = DetectionResult(
+        status=DetectionStatus.OK, confidence=0.10, explanation="Local CV check passed."
+    )
+    plugin._gate_state = {"open": True, "hidden": 0.08, "reason": "ok"}
+    plugin._run_local_tick()
+    entry = plugin._history[0]
+    assert entry["kind"] == "tick"
+    assert "Local CV tick" in entry["explanation"]
+    assert "8%" in entry["explanation"]
+    # Live image refreshed with the tick frame; the log thumbnail is downscaled
+    assert plugin._latest_annotated_jpeg is not None
+    with Image.open(io.BytesIO(plugin._history_snapshots[entry["snap_id"]])) as thumb:
+        assert thumb.width <= 480
+    with Image.open(io.BytesIO(plugin._latest_annotated_jpeg)) as live:
+        assert live.width == 1280
+
+
+def test_local_tick_cadence_is_fixed_start_to_start():
+    nxt = PrintGuardPlugin._next_local_time
+    # On time capture taking 4s: next is exactly one interval after the scheduled start (not after the end)
+    assert nxt(1000.0, 1004.0, 30.0) == pytest.approx(1030.0)
+    # Capture delayed 25s by the smart-capture wait: next is not squeezed against it (half interval minimum)
+    assert nxt(1000.0, 1025.0, 30.0) == pytest.approx(1040.0)
+
+
+def test_gate_payload_reports_countdowns():
+    import time as _time
+
+    plugin = PrintGuardPlugin()
+    now = _time.time()
+    plugin._schedule = {"local_due": now + 12.0, "hybrid_due": now + 600.0}
+    payload = plugin._gate_payload()
+    assert 10.0 <= payload["next_local_in"] <= 12.0
+    assert 590.0 <= payload["next_hybrid_in"] <= 600.0

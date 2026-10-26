@@ -117,12 +117,15 @@ class PrintGuardPlugin(
         self._clean_tick_streak: int = 0
         self._false_alarm_count: int = 0
         self._escalation_block_until: float = 0.0
+        self._schedule: Dict[str, float] = {}
+        self._last_gate_push: float = 0.0
+        self._last_gate_open: Optional[bool] = None
         self._last_result: Optional[DetectionResult] = None
         self._latest_raw_jpeg: Optional[bytes] = None
         self._latest_annotated_jpeg: Optional[bytes] = None
-        self._history: Deque[Dict[str, Any]] = deque(maxlen=30)
+        self._history: Deque[Dict[str, Any]] = deque(maxlen=120)
         self._history_snapshots: Dict[str, bytes] = {}
-        self._history_snap_ids: Deque[str] = deque(maxlen=30)
+        self._history_snap_ids: Deque[str] = deque(maxlen=120)
 
         self._detector: Optional[HybridDetector] = None
         self._notifier: Optional[NotificationManager] = None
@@ -795,10 +798,41 @@ class PrintGuardPlugin(
         self._in_fast_recheck = False
         return float(normal_interval)
 
+    def _send_gate_update(self) -> None:
+        """Light UI message: live capture-window state and next-check countdowns (no history payload)."""
+        if self._plugin_manager is None:
+            return
+        try:
+            self._plugin_manager.send_plugin_message(
+                self._identifier,
+                {"type": "gate", **self._gate_payload()},
+            )
+        except Exception as exc:
+            self._logger.debug("Could not push gate update: %s", exc)
+
+    def _gate_payload(self) -> Dict[str, Any]:
+        now = time.time()
+        return {
+            "capture_gate": {
+                "open": bool(self._gate_state.get("open", True)),
+                "hidden": self._gate_state.get("hidden"),
+                "reason": self._gate_state.get("reason"),
+                "nozzle": self._gate_state.get("nozzle"),
+                "last_capture": self._last_capture,
+            },
+            "next_local_in": (
+                max(0.0, self._schedule["local_due"] - now) if self._schedule.get("local_due") else None
+            ),
+            "next_hybrid_in": (
+                max(0.0, self._schedule["hybrid_due"] - now) if self._schedule.get("hybrid_due") else None
+            ),
+        }
+
     def _monitoring_loop(self) -> None:
         now = time.time()
         next_hybrid = now
-        next_local = now + max(5, int(self._get_setting("local_cv_interval_seconds", 30) or 30))
+        local_iv0 = max(5, int(self._get_setting("local_cv_interval_seconds", 30) or 30))
+        next_local = now + local_iv0
         arm_since: Optional[float] = None
 
         while not self._stop_event.is_set():
@@ -807,21 +841,34 @@ class PrintGuardPlugin(
             local_iv = max(5, int(self._get_setting("local_cv_interval_seconds", 30) or 30))
             due_h = next_hybrid
             due_l = next_local if local_on else float("inf")
-            due = min(due_h, due_l)
-            if now < due:
-                self._stop_event.wait(min(due - now, 1.0))
-                continue
-            kind = "hybrid" if due_h <= due_l else "local"
+            self._schedule = {
+                "hybrid_due": due_h,
+                "local_due": due_l if due_l != float("inf") else 0.0,
+            }
 
-            # Smart capture: wait (up to a limit) for the toolhead to leave the camera's line of sight
+            # Keep the capture-window state live (not only when a check is due) and push it to the UI
             gate = self._smart_gate()
             self._gate_state = gate
+            is_open = bool(gate.get("open"))
+            if self._last_gate_open is None or is_open != self._last_gate_open or (now - self._last_gate_push) >= 5.0:
+                self._last_gate_open = is_open
+                self._last_gate_push = now
+                self._send_gate_update()
+
+            due = min(due_h, due_l)
+            if now < due:
+                self._stop_event.wait(min(due - now, 0.5))
+                continue
+            kind = "hybrid" if due_h <= due_l else "local"
+            due_at = due
+
+            # Smart capture: wait (up to a limit) for the toolhead to leave the camera's line of sight
             max_wait = max(0, int(self._get_setting("smart_capture_max_wait_seconds", 90)))
-            if not gate.get("open"):
+            if not is_open:
                 if arm_since is None:
                     arm_since = now
                 if (now - arm_since) < max_wait:
-                    self._stop_event.wait(0.5)
+                    self._stop_event.wait(0.25)
                     continue
             waited = (now - arm_since) if arm_since is not None else 0.0
             self._last_capture = {
@@ -829,7 +876,7 @@ class PrintGuardPlugin(
                 "kind": kind,
                 "waited_s": round(waited, 1),
                 "hidden": gate.get("hidden"),
-                "reason": gate.get("reason") if gate.get("open") else "max-wait",
+                "reason": gate.get("reason") if is_open else "max-wait",
             }
             arm_since = None
 
@@ -843,7 +890,9 @@ class PrintGuardPlugin(
                     next_local = time.time() + local_iv
                 else:
                     escalate = self._run_local_tick()
-                    next_local = time.time() + local_iv
+                    t_after = time.time()
+                    # Fixed cadence (start to start), but never closer than half an interval after a capture
+                    next_local = self._next_local_time(due_at, t_after, local_iv)
                     if escalate:
                         self._logger.info(
                             "Local CV anomaly on %d consecutive ticks — escalating to Hybrid check",
@@ -861,6 +910,11 @@ class PrintGuardPlugin(
                 else:
                     next_local = time.time() + local_iv
 
+    @staticmethod
+    def _next_local_time(due_at: float, t_after: float, interval: float) -> float:
+        """Fixed start-to-start cadence, but never closer than half an interval after the capture itself."""
+        return max(due_at + interval, t_after + interval * 0.5)
+
     def _run_local_tick(self) -> bool:
         """Cheap Local-CV-only check. Returns True when the anomaly streak calls for a Hybrid escalation."""
         if self._detector is None:
@@ -873,6 +927,7 @@ class PrintGuardPlugin(
             res = self._detector.local_detector.analyze(raw, context=context)  # type: ignore[union-attr]
         esc_th = float(self._get_setting("escalation_threshold", 0.35))
         anomalous = res.confidence >= esc_th
+        self._record_tick(raw, res, context)
         self._cv_ticks.append(
             {
                 "ts": time.time(),
@@ -896,6 +951,42 @@ class PrintGuardPlugin(
             self._local_cv_streak = 0
             return True
         return False
+
+    @staticmethod
+    def _shrink_jpeg(jpeg: bytes, max_width: int = 480, quality: int = 72) -> bytes:
+        """Downscale a JPEG for the log thumbnails of fast ticks (keeps memory small)."""
+        try:
+            with Image.open(io.BytesIO(jpeg)) as im:
+                if im.width <= max_width:
+                    return jpeg
+                h = max(1, int(im.height * max_width / float(im.width)))
+                small = im.convert("RGB").resize(
+                    (max_width, h), getattr(Image, "Resampling", Image).BILINEAR
+                )
+                out = io.BytesIO()
+                small.save(out, format="JPEG", quality=quality)
+                return out.getvalue()
+        except Exception:
+            return jpeg
+
+    def _record_tick(self, raw: bytes, res: DetectionResult, context: PrinterContext) -> None:
+        """Show every fast Local CV capture: update the live image and add a compact row to the log."""
+        hidden = self._gate_state.get("hidden")
+        hidden_txt = f", toolhead hides {hidden * 100:.0f}% of layer" if hidden is not None else ""
+        res.explanation = (
+            f"Local CV tick: score {res.confidence * 100:.0f}%{hidden_txt}. {res.explanation}"
+        )
+        res.source = "local_cv"
+        res.z_height = context.current_z
+        try:
+            annotated = annotate_snapshot(
+                raw, res, expected_model_jpeg=context.expected_model_jpeg
+            )
+        except Exception:
+            annotated = raw
+        self._latest_raw_jpeg = raw
+        self._latest_annotated_jpeg = annotated
+        self._record_history(res, kind="tick", jpeg=self._shrink_jpeg(annotated))
 
     def _register_cv_outcome(self, result: DetectionResult) -> bool:
         """Count Local CV false alarms (Local CV >= threshold, Vision AI answered OK). True = limit reached."""
@@ -1061,11 +1152,17 @@ class PrintGuardPlugin(
             self._pause_for_cv_disagreement(context, result)
         return result
 
-    def _record_history(self, result: DetectionResult) -> None:
+    def _record_history(
+        self,
+        result: DetectionResult,
+        kind: str = "check",
+        jpeg: Optional[bytes] = None,
+    ) -> None:
         """Store a result (and its annotated snapshot) in the Recent Inspection Log and push a UI update."""
         self._last_result = result
         snap_id = str(int(result.timestamp * 1000))
-        if self._latest_annotated_jpeg:
+        snap_bytes = jpeg if jpeg is not None else self._latest_annotated_jpeg
+        if snap_bytes:
             if (
                 self._history_snap_ids.maxlen
                 and len(self._history_snap_ids) >= self._history_snap_ids.maxlen
@@ -1073,8 +1170,9 @@ class PrintGuardPlugin(
                 oldest_id = self._history_snap_ids.pop()
                 self._history_snapshots.pop(oldest_id, None)
             self._history_snap_ids.appendleft(snap_id)
-            self._history_snapshots[snap_id] = self._latest_annotated_jpeg
+            self._history_snapshots[snap_id] = snap_bytes
         entry = result.to_dict()
+        entry["kind"] = kind
         entry["snap_id"] = snap_id
         entry["snapshot_url"] = f"plugin/printguard/history_snapshot/{snap_id}.jpg"
         self._history.appendleft(entry)
@@ -1206,6 +1304,8 @@ class PrintGuardPlugin(
             "cv_false_alarm_count": self._false_alarm_count,
             "cv_false_alarm_limit": int(self._get_setting("cv_false_alarm_limit", 5) or 0),
             "cv_ticks": list(self._cv_ticks)[-20:],
+            "next_local_in": self._gate_payload()["next_local_in"],
+            "next_hybrid_in": self._gate_payload()["next_hybrid_in"],
             "capture_gate": {
                 "open": bool(self._gate_state.get("open", True)),
                 "hidden": self._gate_state.get("hidden"),

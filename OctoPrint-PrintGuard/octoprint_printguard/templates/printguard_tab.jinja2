@@ -82,6 +82,7 @@
                 </div>
                 <div class="printguard-explanation" data-bind="text: lastExplanation"></div>
                 <div class="muted" style="font-size: 12px; margin-top: 4px;" data-bind="text: localCvStatusText"></div>
+                <div class="muted" style="font-size: 12px;" data-bind="visible: nextCheckText, text: nextCheckText"></div>
                 <div class="muted" style="font-size: 12px;" data-bind="visible: captureGateText, text: captureGateText"></div>
                 <div class="muted" style="font-size: 11px; margin-top: 4px;" data-bind="visible: expectedModelSummary, text: expectedModelSummary"></div>
             </div>
@@ -160,7 +161,11 @@
     <!-- Recent Inspection History -->
     <div class="row-fluid">
         <div class="span12">
-            <h4>Recent Inspection Log</h4>
+            <h4>Recent Inspection Log
+                <label class="checkbox inline" style="font-size: 12px; font-weight: normal; margin-left: 12px;">
+                    <input type="checkbox" data-bind="checked: showTicks"> show fast Local CV captures
+                </label>
+            </h4>
             <table class="table table-striped table-bordered table-condensed">
                 <thead>
                     <tr>
@@ -174,9 +179,14 @@
                         <th>Notes / Action</th>
                     </tr>
                 </thead>
-                <tbody data-bind="foreach: history">
+                <tbody data-bind="foreach: visibleHistory">
                     <tr>
-                        <td data-bind="text: $parent.formatTimestamp(timestamp)"></td>
+                        <td>
+                            <span data-bind="text: $parent.formatTimestamp(timestamp)"></span>
+                            <!-- ko if: $data.kind === 'tick' -->
+                            <span class="label label-info" style="font-size: 9px;">tick</span>
+                            <!-- /ko -->
+                        </td>
                         <td style="text-align: center; width: 96px;">
                             <!-- ko if: $data.snapshot_url -->
                             <img class="printguard-log-thumb" title="Click to enlarge snapshot"
