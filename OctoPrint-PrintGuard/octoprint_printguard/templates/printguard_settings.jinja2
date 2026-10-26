@@ -175,6 +175,15 @@
     </div>
 
     <div class="control-group">
+        <label class="control-label">Delay Before First Check (seconds)</label>
+        <div class="controls">
+            <input type="number" class="input-small" min="0" max="3600"
+                   data-bind="value: settings.plugins.printguard.start_delay_seconds">
+            <span class="help-block">No Hybrid or Local CV checks run during the first minutes after a print starts (heating, homing, first layer settling). Default <code>300</code>s (5 min), <code>0</code> = check right away.</span>
+        </div>
+    </div>
+
+    <div class="control-group">
         <label class="control-label">Initial Grace Period (seconds)</label>
         <div class="controls">
             <input type="number" class="input-small" min="0" max="600"

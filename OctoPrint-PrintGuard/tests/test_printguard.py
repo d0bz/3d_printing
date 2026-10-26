@@ -748,3 +748,29 @@ def test_gate_payload_reports_countdowns():
     payload = plugin._gate_payload()
     assert 10.0 <= payload["next_local_in"] <= 12.0
     assert 590.0 <= payload["next_hybrid_in"] <= 600.0
+
+
+def test_no_checks_during_print_start_delay():
+    import time as _time
+
+    nxt = PrintGuardPlugin._initial_schedule
+    now = 1000.0
+    # Print just started with a 300s delay: first Hybrid at +300s, first Local CV one interval later
+    assert nxt(now, now + 300.0, 30.0) == (1300.0, 1330.0)
+    # Resume / manual start (delay already over): check immediately
+    assert nxt(now, now - 50.0, 30.0) == (1000.0, 1030.0)
+
+    plugin = PrintGuardPlugin()
+    plugin._printer = MagicMock()
+    plugin._printer.is_printing.return_value = True
+    plugin._printer.get_current_data.return_value = {"progress": {"completion": 0.0}, "job": {"file": {}}}
+    plugin._printer.get_current_temperatures.return_value = {}
+    plugin._settings = _FakeSettings({"start_delay_seconds": 300, "enabled": False})
+    before = _time.time()
+    plugin.on_event("PrintStarted", {})
+    plugin.stop_monitoring()
+    assert plugin._start_delay_until >= before + 299.0
+    plugin._settings.set(["start_delay_seconds"], 0)
+    plugin.on_event("PrintStarted", {})
+    plugin.stop_monitoring()
+    assert plugin._start_delay_until <= _time.time() + 0.5

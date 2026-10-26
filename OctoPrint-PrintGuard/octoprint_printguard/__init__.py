@@ -7,7 +7,7 @@ import logging
 import os
 import threading
 import time
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from PIL import Image, ImageDraw
 import requests
@@ -118,6 +118,7 @@ class PrintGuardPlugin(
         self._false_alarm_count: int = 0
         self._escalation_block_until: float = 0.0
         self._schedule: Dict[str, float] = {}
+        self._start_delay_until: float = 0.0
         self._last_gate_push: float = 0.0
         self._last_gate_open: Optional[bool] = None
         self._last_result: Optional[DetectionResult] = None
@@ -224,6 +225,7 @@ class PrintGuardPlugin(
             "max_occluded_fraction": 0.15,
             "smart_capture_max_wait_seconds": 90,
             "initial_grace_seconds": 45,
+            "start_delay_seconds": 300,
             "detection_mode": "hybrid",  # "hybrid", "local_only", "vision_ai_only"
             "sensitivity": 1.0,
             "warning_threshold": 0.45,
@@ -641,6 +643,10 @@ class PrintGuardPlugin(
             self._escalation_block_until = 0.0
             self._cv_ticks.clear()
             self._nozzle_tracker.reset()
+            # No point inspecting the first minutes of a print (heating, homing, first layer settling)
+            self._start_delay_until = time.time() + max(
+                0, int(self._get_setting("start_delay_seconds", 300) or 0)
+            )
             if self._detector is None:
                 self._rebuild_components()
             if self._detector is not None:
@@ -828,11 +834,16 @@ class PrintGuardPlugin(
             ),
         }
 
+    @staticmethod
+    def _initial_schedule(now: float, start_delay_until: float, local_iv: float) -> Tuple[float, float]:
+        """First Hybrid / Local CV due times: nothing runs before the print-start delay has passed."""
+        first = max(now, start_delay_until)
+        return first, first + local_iv
+
     def _monitoring_loop(self) -> None:
         now = time.time()
-        next_hybrid = now
         local_iv0 = max(5, int(self._get_setting("local_cv_interval_seconds", 30) or 30))
-        next_local = now + local_iv0
+        next_hybrid, next_local = self._initial_schedule(now, self._start_delay_until, local_iv0)
         arm_since: Optional[float] = None
 
         while not self._stop_event.is_set():
