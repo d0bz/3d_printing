@@ -74,6 +74,15 @@
     </div>
 
     <div class="control-group">
+        <label class="control-label">Fast Failure Re-Check Wait (seconds)</label>
+        <div class="controls">
+            <input type="number" class="input-small" min="5" max="300"
+                   data-bind="value: settings.plugins.printguard.failure_recheck_seconds">
+            <span class="help-block">When a failure or warning is detected, wait this many seconds (default: <code>30</code>s) and immediately run a confirmation check so genuine failures are paused quickly without waiting for the full check interval.</span>
+        </div>
+    </div>
+
+    <div class="control-group">
         <label class="control-label">Vision AI Check Every N Checks</label>
         <div class="controls">
             <input type="number" class="input-small" min="1" max="100"

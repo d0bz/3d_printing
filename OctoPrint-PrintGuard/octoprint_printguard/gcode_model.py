@@ -482,73 +482,112 @@ class GCodeModelAnalyzer:
         span_z = max(5.0, model.z_max)
 
         # ------------------------------------------------------------------
-        # 1. Left Panel: 3D Isometric Projection (x: 10..330, y: 36..440)
+        # 1. Left Panel: 3D Isometric Projection (x: 12..330, y: 36..440)
         # ------------------------------------------------------------------
-        iso_w, iso_h = 320, 400
-        iso_cx, iso_by = 170, 390
-        max_dim = max(span_x, span_y, span_z * 1.1)
-        iso_scale = min(iso_w, iso_h) * 0.62 / max_dim
-
         cos30 = 0.8660254
         sin30 = 0.5
 
-        def to_iso(x: float, y: float, z: float) -> Tuple[int, int]:
-            dx = x - cx
-            dy = y - cy
-            px = iso_cx + (dx - dy) * cos30 * iso_scale
-            py = iso_by - z * iso_scale * 1.15 - (dx + dy) * sin30 * iso_scale * 0.55
-            return int(px), int(py)
-
-        # Draw build plate grid under model in isometric view
-        pad_mm = max(8.0, 0.2 * max(span_x, span_y))
+        pad_mm = max(6.0, 0.12 * max(span_x, span_y))
         bx0, bx1 = model.x_min - pad_mm, model.x_max + pad_mm
         by0, by1 = model.y_min - pad_mm, model.y_max + pad_mm
+
+        def _raw_iso(x: float, y: float, z: float) -> Tuple[float, float]:
+            dx = x - cx
+            dy = y - cy
+            rx = (dx - dy) * cos30
+            ry = -z * 1.15 - (dx + dy) * sin30 * 0.55
+            return rx, ry
+
+        corners = [
+            _raw_iso(x_c, y_c, z_c)
+            for x_c in (bx0, bx1)
+            for y_c in (by0, by1)
+            for z_c in (0.0, span_z)
+        ]
+        rx_min = min(c[0] for c in corners)
+        rx_max = max(c[0] for c in corners)
+        ry_min = min(c[1] for c in corners)
+        ry_max = max(c[1] for c in corners)
+
+        vp_x0, vp_x1 = 18.0, 326.0
+        vp_y0, vp_y1 = 82.0, 434.0
+        iso_scale = min(
+            (vp_x1 - vp_x0) / max(1.0, rx_max - rx_min),
+            (vp_y1 - vp_y0) / max(1.0, ry_max - ry_min),
+        )
+        iso_cx = 0.5 * (vp_x0 + vp_x1) - 0.5 * (rx_min + rx_max) * iso_scale
+        iso_by = 0.5 * (vp_y0 + vp_y1) - 0.5 * (ry_min + ry_max) * iso_scale
+
+        def to_iso(x: float, y: float, z: float) -> Tuple[int, int]:
+            rx, ry = _raw_iso(x, y, z)
+            return int(iso_cx + rx * iso_scale), int(iso_by + ry * iso_scale)
+
+        # Draw Z-progression bar at top of Left Panel (y: 56..72)
+        pct_val = min(100.0, (current_z / model.z_max) * 100.0) if model.z_max > 0 else 100.0
+        draw.text(
+            (16, 38),
+            f"3D Build Progress: Layer {len(active_layers)}/{model.total_layers} ({pct_val:.1f}%)",
+            fill=(160, 215, 255),
+            font=font,
+        )
+        bar_x0, bar_y0, bar_x1, bar_y1 = 16, 54, 326, 68
+        draw.rectangle([bar_x0, bar_y0, bar_x1, bar_y1], fill=(26, 32, 44), outline=(65, 85, 115))
+        fill_w = int((bar_x1 - bar_x0 - 2) * min(1.0, max(0.02, pct_val / 100.0)))
+        if fill_w > 0:
+            draw.rectangle(
+                [bar_x0 + 1, bar_y0 + 1, bar_x0 + 1 + fill_w, bar_y1 - 1],
+                fill=(45, 215, 130),
+            )
+        draw.text(
+            (bar_x0 + 8, bar_y0 + 2),
+            f"Z = {current_z:.2f} mm / {model.z_max:.2f} mm",
+            fill=(255, 255, 255),
+            font=font,
+        )
+
+        # Draw build plate grid under model in isometric view
         bed_poly = [
             to_iso(bx0, by0, 0.0),
             to_iso(bx1, by0, 0.0),
             to_iso(bx1, by1, 0.0),
             to_iso(bx0, by1, 0.0),
         ]
-        draw.polygon(bed_poly, fill=(26, 32, 44), outline=(65, 85, 115))
+        draw.polygon(bed_poly, fill=(24, 30, 42), outline=(70, 92, 125))
 
-        # Sample layers so rendering takes < 15ms even for 1000-layer prints
-        total_ly = len(model.layers)
-        step = max(1, total_ly // 90)
-        sampled_layers = model.layers[::step]
-        if model.layers[-1] not in sampled_layers:
-            sampled_layers.append(model.layers[-1])
-        if active_layers[-1] not in sampled_layers:
-            sampled_layers.append(active_layers[-1])
-        sampled_layers.sort(key=lambda l: l.z_height)
+        # Sample future layers lightly and completed layers densely so every early layer is visible
+        future_layers = [ly for ly in model.layers if ly.z_height > current_z + 0.05]
+        fut_step = max(1, len(future_layers) // 55) if future_layers else 1
+        sampled_future = future_layers[::fut_step]
+
+        done_step = max(1, len(active_layers) // 65)
+        sampled_done = active_layers[::done_step]
+        if active_layers[-1] not in sampled_done:
+            sampled_done.append(active_layers[-1])
 
         top_active_z = active_layers[-1].z_height
 
         # 1a. Draw ghosted future layers (> current_z) FIRST in the background
-        for ly in sampled_layers:
-            if ly.z_height <= current_z + 0.05:
-                continue
+        for ly in sampled_future:
             for x0, y0, x1, y1, _ in ly.segments[::4]:
                 p0 = to_iso(x0, y0, ly.z_height)
                 p1 = to_iso(x1, y1, ly.z_height)
                 draw.line([p0, p1], fill=(38, 48, 65), width=1)
 
-        # 1b. Draw completed layers (<= current_z) ON TOP in bright emerald green
-        for ly in sampled_layers:
-            if ly.z_height > current_z + 0.05:
-                continue
+        # 1b. Draw completed layers (<= current_z) ON TOP as a solid emerald-green 3D volume
+        for ly in sampled_done:
             is_top_active = abs(ly.z_height - top_active_z) < 0.01
-            if is_top_active:
+            if is_top_active and len(sampled_done) > 1:
                 continue
-            z_ratio = min(1.0, ly.z_height / max(0.1, model.z_max))
+            rel_z = min(1.0, ly.z_height / max(0.2, top_active_z))
             color = (
-                int(35 + 45 * z_ratio),
-                int(175 + 75 * z_ratio),
-                int(120 + 60 * (1.0 - z_ratio)),
+                int(30 + 45 * rel_z),
+                int(155 + 85 * rel_z),
+                int(105 + 45 * (1.0 - rel_z)),
             )
-            for x0, y0, x1, y1, _ in ly.segments[::2]:
+            for x0, y0, x1, y1, _ in ly.segments:
                 p0 = to_iso(x0, y0, ly.z_height)
                 p1 = to_iso(x1, y1, ly.z_height)
-                draw.line([p0, p1], fill=color, width=1)
+                draw.line([p0, p1], fill=color, width=2)
 
         # 1c. Draw active nozzle layer ON TOP OF ALL in bright gold + Z-slice plane outline
         top_ly = active_layers[-1]
@@ -558,16 +597,15 @@ class GCodeModelAnalyzer:
             to_iso(bx1, by1, top_active_z),
             to_iso(bx0, by1, top_active_z),
         ]
-        draw.polygon(z_plane_poly, outline=(180, 150, 45))
+        draw.polygon(z_plane_poly, outline=(195, 165, 50))
         for x0, y0, x1, y1, _ in top_ly.segments:
             p0 = to_iso(x0, y0, top_active_z)
             p1 = to_iso(x1, y1, top_active_z)
             draw.line([p0, p1], fill=(255, 220, 45), width=2)
 
-        draw.text((16, 40), "3D Expected Model @ Current Z", fill=(160, 210, 255), font=font)
         draw.text(
             (16, 448),
-            "Green=Printed | Gold=Current Z | Dark=Remaining",
+            "Green=Printed Volume | Gold=Current Z Layer | Dark=Unprinted",
             fill=(140, 155, 175),
             font=font,
         )
@@ -592,23 +630,37 @@ class GCodeModelAnalyzer:
         # Bed baseline
         draw.line([(fp_x0 + 8, prof_by), (fp_x1 - 8, prof_by)], fill=(100, 120, 150), width=2)
 
-        for ly in sampled_layers:
+        for ly in sampled_future:
             py = int(prof_by - ly.z_height * prof_scale)
             px0 = int(prof_cx + (ly.x_min - cx) * prof_scale)
             px1 = int(prof_cx + (ly.x_max - cx) * prof_scale)
-            is_done = ly.z_height <= current_z + 0.05
-            col = (65, 210, 135) if is_done else (50, 62, 82)
-            draw.line([(px0, py), (px1, py)], fill=col, width=2)
+            draw.line([(px0, py), (px1, py)], fill=(50, 62, 82), width=2)
+
+        for ly in sampled_done:
+            py = int(prof_by - ly.z_height * prof_scale)
+            px0 = int(prof_cx + (ly.x_min - cx) * prof_scale)
+            px1 = int(prof_cx + (ly.x_max - cx) * prof_scale)
+            draw.line([(px0, py), (px1, py)], fill=(55, 220, 135), width=2)
 
         # Current Z indicator line
         cur_py = int(prof_by - min(model.z_max, current_z) * prof_scale)
-        draw.line([(fp_x0 + 6, cur_py), (fp_x1 - 6, cur_py)], fill=(255, 205, 55), width=1)
-        draw.text((fp_x0 + 8, max(fp_y0 + 4, cur_py - 12)), f"Z={current_z:.2f}mm", fill=(255, 215, 70), font=font)
+        draw.line([(fp_x0 + 6, cur_py), (fp_x1 - 6, cur_py)], fill=(255, 205, 55), width=2)
+        draw.text(
+            (fp_x0 + 8, max(fp_y0 + 4, cur_py - 14)),
+            f"Z={current_z:.2f}mm (Layer {len(active_layers)}/{model.total_layers})",
+            fill=(255, 220, 70),
+            font=font,
+        )
 
         # ------------------------------------------------------------------
         # 3. Right Bottom Panel: Top-Down Footprint (X vs Y) (x: 355..625, y: 265..445)
         # ------------------------------------------------------------------
-        draw.text((355, 245), "Top-Down Bed Footprint (X vs Y)", fill=(160, 210, 255), font=font)
+        draw.text(
+            (355, 245),
+            f"Top-Down Slice @ Layer {len(active_layers)} (Z={current_z:.2f}mm)",
+            fill=(160, 210, 255),
+            font=font,
+        )
         td_x0, td_y0, td_x1, td_y1 = 355, 265, 625, 440
         draw.rectangle([td_x0, td_y0, td_x1, td_y1], fill=(24, 29, 38), outline=(55, 68, 88))
 

@@ -216,6 +216,7 @@ $(function () {
             }
             self.consecutiveFailures(data.consecutive_failures || 0);
             self.consecutiveThreshold(data.consecutive_failures_threshold || 2);
+            var prevZ = self.currentZ();
             self.currentZ(data.current_z);
             self.detectionMode(data.detection_mode || "hybrid");
             if (data.expected_model_summary !== undefined) {
@@ -234,6 +235,8 @@ $(function () {
                 self.scoreBedDetachment(sub.bed_detachment || 0.0);
                 self.scoreSpaghetti(sub.spaghetti || 0.0);
                 self.scoreOther(Math.max(sub.layer_shift || 0.0, sub.nozzle_blob || 0.0));
+                self.snapshotTimestamp(Date.now());
+            } else if (data.current_z !== prevZ) {
                 self.snapshotTimestamp(Date.now());
             }
         };

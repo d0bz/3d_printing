@@ -379,3 +379,58 @@ def test_hybrid_suppresses_false_spaghetti_when_vision_ai_confirms_ok(mock_post)
     assert res.bounding_boxes == []
 
 
+def test_fast_failure_recheck_and_zchange_live_model_refresh(tmp_path):
+    gcode_content = """
+;LAYER_COUNT:3
+;LAYER:0
+@Object test_part.stl
+G0 X80.0 Y80.0 Z0.2
+;TYPE:WALL-OUTER
+G1 X120.0 Y80.0 E1.0
+G1 X120.0 Y120.0 E2.0
+;LAYER:1
+G0 X80.0 Y80.0 Z1.0
+;TYPE:WALL-OUTER
+G1 X120.0 Y80.0 E3.0
+G1 X120.0 Y120.0 E4.0
+;LAYER:2
+G0 X80.0 Y80.0 Z2.0
+;TYPE:WALL-OUTER
+G1 X120.0 Y80.0 E5.0
+G1 X120.0 Y120.0 E6.0
+"""
+    (tmp_path / "part.gcode").write_text(gcode_content.strip(), encoding="utf-8")
+
+    plugin = PrintGuardPlugin()
+    plugin._gcode_analyzer = GCodeModelAnalyzer(uploads_dir=str(tmp_path))
+    plugin._printer = MagicMock()
+    plugin._printer.is_printing.return_value = True
+    plugin._printer.get_current_data.return_value = {
+        "progress": {"completion": 10.0},
+        "job": {"file": {"name": "part.gcode", "path": "part.gcode"}},
+    }
+    plugin._printer.get_current_temperatures.return_value = {}
+
+    plugin.on_event("PrintStarted", {})
+    plugin.stop_monitoring()
+    plugin._print_start_time = 100.0
+
+    # Verify ZChange immediately updates expected_model_summary without waiting for camera check
+    plugin.on_event("ZChange", {"old": 0.2, "new": 1.0})
+    assert plugin._latest_expected_model_summary is not None
+    assert "Layer 2/3" in plugin._latest_expected_model_summary
+
+    # Verify 1st failure sets "Re-checking in 30s (1/2)" and 2nd failure pauses print
+    spag_jpeg = _make_spaghetti_jpeg()
+    res1 = plugin.run_single_check(snapshot_bytes=spag_jpeg)
+    assert res1.is_failure
+    assert res1.action_taken == "Re-checking in 30s (1/2)"
+    assert not plugin._printer.pause_print.called
+
+    res2 = plugin.run_single_check(snapshot_bytes=spag_jpeg)
+    assert res2.is_failure
+    assert res2.action_taken == "Print Paused"
+    assert plugin._printer.pause_print.called
+
+
+

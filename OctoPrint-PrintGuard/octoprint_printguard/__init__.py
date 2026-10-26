@@ -104,7 +104,9 @@ class PrintGuardPlugin(
         self._previous_z: Optional[float] = None
         self._z_change_count: int = 0
         self._consecutive_failures: int = 0
+        self._in_fast_recheck: bool = False
         self._last_result: Optional[DetectionResult] = None
+        self._latest_raw_jpeg: Optional[bytes] = None
         self._latest_annotated_jpeg: Optional[bytes] = None
         self._history: Deque[Dict[str, Any]] = deque(maxlen=30)
         self._history_snapshots: Dict[str, bytes] = {}
@@ -189,6 +191,8 @@ class PrintGuardPlugin(
             "phone_camera_port": 8080,
             "snapshot_url": "",
             "check_interval_seconds": 10,
+            "failure_recheck_seconds": 30,
+            "failure_recheck_threshold": 2,
             "initial_grace_seconds": 45,
             "detection_mode": "hybrid",  # "hybrid", "local_only", "vision_ai_only"
             "sensitivity": 1.0,
@@ -591,6 +595,7 @@ class PrintGuardPlugin(
 
         elif event == "PrintResumed":
             self._consecutive_failures = 0
+            self._in_fast_recheck = False
             if bool(self._get_setting("enabled", True)):
                 self.start_monitoring()
 
@@ -606,6 +611,21 @@ class PrintGuardPlugin(
                 try:
                     self._current_z = float(new_z)
                     self._z_change_count += 1
+                    ctx = self._build_printer_context()
+                    if (
+                        self._latest_raw_jpeg is not None
+                        and self._last_result is not None
+                        and ctx.expected_model_jpeg is not None
+                    ):
+                        try:
+                            self._latest_annotated_jpeg = annotate_snapshot(
+                                self._latest_raw_jpeg,
+                                self._last_result,
+                                expected_model_jpeg=ctx.expected_model_jpeg,
+                            )
+                        except Exception:
+                            pass
+                    self._send_ui_update()
                 except (TypeError, ValueError):
                     pass
 
@@ -626,18 +646,32 @@ class PrintGuardPlugin(
     def stop_monitoring(self) -> None:
         with self._monitor_lock:
             self._is_monitoring = False
+            self._in_fast_recheck = False
             self._stop_event.set()
         self._send_ui_update()
 
     def _monitoring_loop(self) -> None:
         while not self._stop_event.is_set():
-            interval = max(2, int(self._get_setting("check_interval_seconds", 10)))
+            normal_interval = max(2, int(self._get_setting("check_interval_seconds", 10)))
+            wait_sec = normal_interval
             try:
                 if bool(self._get_setting("enabled", True)):
-                    self.run_single_check()
+                    res = self.run_single_check(force_vision_ai=self._in_fast_recheck)
+                    if res.is_failure or res.is_warning:
+                        recheck_sec = max(5, int(self._get_setting("failure_recheck_seconds", 30)))
+                        wait_sec = min(normal_interval, recheck_sec)
+                        self._in_fast_recheck = True
+                        self._logger.info(
+                            "Anomaly detected (status=%s, conf=%.2f) — scheduling fast verification re-check in %ds",
+                            res.status.value,
+                            res.confidence,
+                            wait_sec,
+                        )
+                    else:
+                        self._in_fast_recheck = False
             except Exception as exc:
                 self._logger.warning("Monitoring check error: %s", exc)
-            self._stop_event.wait(interval)
+            self._stop_event.wait(wait_sec)
 
     def run_single_check(
         self,
@@ -649,12 +683,13 @@ class PrintGuardPlugin(
             self._rebuild_components()
 
         raw_jpeg = snapshot_bytes if snapshot_bytes is not None else self.fetch_snapshot()
+        self._latest_raw_jpeg = raw_jpeg
         context = self._build_printer_context()
 
         result = self._detector.analyze(  # type: ignore[union-attr]
             raw_jpeg,
             context=context,
-            force_vision_ai=force_vision_ai,
+            force_vision_ai=force_vision_ai or self._in_fast_recheck,
         )
 
         # Track consecutive failures
@@ -663,6 +698,29 @@ class PrintGuardPlugin(
         else:
             self._consecutive_failures = 0
         result.consecutive_failures = self._consecutive_failures
+
+        # Check if threshold reached for automatic printer intervention & notifications
+        cfg_threshold = max(1, int(self._get_setting("consecutive_failures_threshold", 2)))
+        recheck_threshold = max(1, int(self._get_setting("failure_recheck_threshold", 2)))
+        threshold = min(cfg_threshold, recheck_threshold)
+        recheck_sec = max(5, int(self._get_setting("failure_recheck_seconds", 30)))
+        grace_sec = max(0, int(self._get_setting("initial_grace_seconds", 45)))
+        in_grace_period = (
+            context.is_printing
+            and self._print_start_time is not None
+            and context.print_time_elapsed < grace_sec
+        )
+
+        should_notify_failure = False
+        if result.is_failure and self._consecutive_failures >= threshold:
+            if not in_grace_period:
+                action = self._execute_failure_action(context)
+                result.action_taken = action
+            else:
+                result.action_taken = f"Grace period active ({int(context.print_time_elapsed)}s/{grace_sec}s)"
+            should_notify_failure = True
+        elif result.is_failure:
+            result.action_taken = f"Re-checking in {recheck_sec}s ({self._consecutive_failures}/{threshold})"
 
         # Annotate snapshot for UI and notifications
         try:
@@ -675,22 +733,7 @@ class PrintGuardPlugin(
             self._logger.debug("Snapshot annotation error: %s", exc)
             self._latest_annotated_jpeg = raw_jpeg
 
-        # Check if threshold reached for automatic printer intervention & notifications
-        threshold = max(1, int(self._get_setting("consecutive_failures_threshold", 2)))
-        grace_sec = max(0, int(self._get_setting("initial_grace_seconds", 45)))
-        in_grace_period = (
-            context.is_printing
-            and self._print_start_time is not None
-            and context.print_time_elapsed < grace_sec
-        )
-
-        if result.is_failure and self._consecutive_failures >= threshold:
-            if not in_grace_period:
-                action = self._execute_failure_action(context)
-                result.action_taken = action
-            else:
-                result.action_taken = f"Grace period active ({int(context.print_time_elapsed)}s/{grace_sec}s)"
-
+        if should_notify_failure:
             self._notifier.notify(  # type: ignore[union-attr]
                 result=result,
                 snapshot_jpeg=self._latest_annotated_jpeg,
@@ -821,15 +864,21 @@ class PrintGuardPlugin(
             )
         options.append({"id": "custom", "label": "Custom Snapshot URL"})
 
+        cfg_th = max(1, int(self._get_setting("consecutive_failures_threshold", 2)))
+        recheck_th = max(1, int(self._get_setting("failure_recheck_threshold", 2)))
+        effective_th = min(cfg_th, recheck_th)
+
         return {
             "is_monitoring": self._is_monitoring,
+            "in_fast_recheck": self._in_fast_recheck,
             "active_camera": str(self._get_setting("active_camera", "camera1")),
             "phone_camera_ip": phone_ip,
             "cam2_connected": cam2_connected,
             "camera_options": options,
             "consecutive_failures": self._consecutive_failures,
-            "consecutive_failures_threshold": int(
-                self._get_setting("consecutive_failures_threshold", 2)
+            "consecutive_failures_threshold": effective_th,
+            "failure_recheck_seconds": int(
+                self._get_setting("failure_recheck_seconds", 30)
             ),
             "check_interval_seconds": int(
                 self._get_setting("check_interval_seconds", 10)
