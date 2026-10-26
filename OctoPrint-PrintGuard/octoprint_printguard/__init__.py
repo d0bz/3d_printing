@@ -1104,10 +1104,23 @@ class PrintGuardPlugin(
 
     @_blueprint_route("/expected_model.jpg", methods=["GET"])
     def get_expected_model_snapshot(self) -> Any:
-        if not self._is_logged_in():
+        if not (self._is_logged_in() or self._is_direct_local_lan()):
             return flask.Response("OctoPrint login required", status=403)
-        ctx = self._build_printer_context()
-        jpeg_bytes = ctx.expected_model_jpeg or self._latest_expected_model_jpeg
+        q_file = flask.request.args.get("file") if flask else None
+        q_z = flask.request.args.get("z", type=float) if flask else None
+        q_pct = flask.request.args.get("pct", type=float) if flask else None
+        if q_file is not None or q_z is not None or q_pct is not None:
+            ctx = self._build_printer_context()
+            st = self._gcode_analyzer.get_expected_state(
+                q_file or ctx.filepath or ctx.filename,
+                current_z=q_z,
+                progress_completion=q_pct,
+                is_printing=True,
+            )
+            jpeg_bytes = st.reference_jpeg if st is not None else None
+        else:
+            ctx = self._build_printer_context()
+            jpeg_bytes = ctx.expected_model_jpeg or self._latest_expected_model_jpeg
         if jpeg_bytes is None:
             placeholder = self._generate_test_card(
                 DetectionResult(
